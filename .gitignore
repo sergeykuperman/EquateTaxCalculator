@@ -1,0 +1,17 @@
+# sale data & outputs (contain personal financial data)
+consumption_*.csv
+sale_*.pdf
+*_with_calc.xlsx
+tax_summary_*.xlsx
+portfolio_projection_5y.xlsx
+
+# Windows NTFS alternate data streams
+*:Zone.Identifier
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# logs
+*.log
