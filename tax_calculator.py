@@ -139,12 +139,11 @@ def process_pair(csv_path):
     # allocate fees proportionally per lot by share count, deduct from gain before tax
     df["fees_shekel_lot"]  = fees_shekels * (df["Consumption"] / df["Consumption"].sum())
     df["real_gain_shekel"] = df["gross_sale_shekel"] - df["cost_shekel"] - df["fees_shekel_lot"]
-    df["tax_to_pay"]       = df["real_gain_shekel"] * TAX_RATE
 
-    # totals
+    # totals — tax is on the net gain for the whole sale, not per lot
     total_gross_sale_shekel = df["gross_sale_shekel"].sum()
     total_real_gain         = df["real_gain_shekel"].sum()
-    total_tax_to_pay        = df["tax_to_pay"].sum()
+    total_tax_to_pay        = max(0.0, total_real_gain) * TAX_RATE
 
     # write Data + Summary into two sheets
     out = csv_path.replace(".csv", "_with_calc.xlsx")
@@ -181,12 +180,13 @@ def main():
         return
 
     summary_df = pd.DataFrame(rows).sort_values("Sale date")
+    net_annual_gain = summary_df["Total_real_gain_shekel"].sum()
     total_row = {
         "Sale date":                "TOTAL",
         "Fees_shekels":             summary_df["Fees_shekels"].sum(),
         "Total_gross_sale_shekel":  summary_df["Total_gross_sale_shekel"].sum(),
-        "Total_real_gain_shekel":   summary_df["Total_real_gain_shekel"].sum(),
-        "Total_tax_to_pay":         summary_df["Total_tax_to_pay"].sum(),
+        "Total_real_gain_shekel":   net_annual_gain,
+        "Total_tax_to_pay":         max(0.0, net_annual_gain) * TAX_RATE,
     }
     summary_df = pd.concat([summary_df, pd.DataFrame([total_row])], ignore_index=True)
 
