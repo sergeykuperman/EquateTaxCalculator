@@ -50,9 +50,9 @@ Parses an Interactive Brokers annual tax statement PDF and produces `tax_ibkr_su
 | Row | Description |
 |-----|-------------|
 | Interest income | ILS equivalent of IBKR interest (SYEP), converted via BoI rate |
-| Dividend spread by country | Per-country ILS totals derived from ISIN prefix (US/GB/BM/JE/…), each dividend converted via BoI rate on payment date |
-| Dividend total | Sum of all country dividend totals |
-| Dividend + external income total | Dividend total + interest income |
+| Dividend spread by country | Per-country ILS totals derived from ISIN prefix (US/GB/BM/JE/…), each dividend and Payment in Lieu of Dividend converted via BoI rate on payment date |
+| Dividend total | Sum of all country dividend totals (includes Payments in Lieu of Dividends) |
+| Dividend + external income total | Dividend total (incl. Payments in Lieu) + interest income |
 | Foreign withholding tax | Pre-converted ILS total from IBKR Cash Report (negative) |
 | IBKR positive realized stock gains | S/T + L/T realized gains in ILS from Performance Summary |
 | IBKR realized stock losses | S/T + L/T realized losses in ILS from Performance Summary |
