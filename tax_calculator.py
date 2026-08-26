@@ -17,7 +17,7 @@ TAX_RATE = 0.25  # 25%
 # ─── PARSE SALE PARAMETERS FROM PDF ────────────────────────────────────────────
 def parse_sale_pdf(path):
     """
-    Extract SALE_PRICE (€), Settlement date, EX_RATE (ILS/€), FEES_EURO from sale_*.pdf.
+    Extract SALE_PRICE (€), execution date, settlement date, EX_RATE (ILS/€), FEES_EURO from sale_*.pdf.
     """
     with pdfplumber.open(path) as pdf:
         text = pdf.pages[0].extract_text()
@@ -26,7 +26,11 @@ def parse_sale_pdf(path):
     m = re.search(r"Quantity\s*-\s*Shares[\s\S]*?([\d.,]+)\s*(?:€|EUR)", text)
     sale_price = float(m.group(1).replace(",", "")) if m else None
 
-    # Settlement date: e.g. "Settlement date: 10 Jul 2025"
+    # Execution date (trade/sale date for FX purposes): e.g. "Execution date: 1 Jul 2024 09:00:00 CET"
+    m = re.search(r"Execution date:\s*([\d]{1,2}\s+[A-Za-z]+\s+\d{4})", text)
+    execution_date = datetime.strptime(m.group(1), "%d %b %Y") if m else None
+
+    # Settlement date (kept for reference): e.g. "Settlement date: 3 Jul 2024"
     m = re.search(r"Settlement date:\s*([\d]{1,2}\s+[A-Za-z]+\s+\d{4})", text)
     settlement_date = datetime.strptime(m.group(1), "%d %b %Y") if m else None
 
@@ -44,13 +48,13 @@ def parse_sale_pdf(path):
         m = re.search(r"\b([0-9]{1,2}\.\d{2})\b", text)
     fees_euro = float(m.group(1)) if m else None
 
-    if None in (sale_price, settlement_date, ex_rate, fees_euro):
+    if None in (sale_price, execution_date, ex_rate, fees_euro):
         raise RuntimeError(f"Failed to parse all sale params from {path}:\n"
                            f" sale_price={sale_price}, "
-                           f"settle={settlement_date}, "
+                           f"execution={execution_date}, "
                            f"FX={ex_rate}, "
                            f"fees={fees_euro}")
-    return sale_price, settlement_date, ex_rate, fees_euro
+    return sale_price, execution_date, settlement_date, ex_rate, fees_euro
 
 # ─── BANK OF ISRAEL EUR/ILS RATE ─────────────────────────────────────────────
 def boi_eur_ils(day: str | dt.date, *, live: bool = False) -> float:
@@ -106,10 +110,10 @@ def process_pair(csv_path):
         print(f"Warning: no {sale_pdf} for {csv_path}, skipping")
         return
 
-    # parse that PDF, then fetch settlement BoI FX rate (required by Israeli tax law)
-    sale_price, settlement_date, _pdf_ex_rate, fees_euro = parse_sale_pdf(sale_pdf)
-    fx_set = boi_eur_ils(settlement_date.date())
-    print(f"[{date_key}] sale_price={sale_price}€, settle={settlement_date.date()}, BoI FX={fx_set}, fees={fees_euro}€")
+    # parse that PDF, then fetch BoI FX rate on the execution (trade) date
+    sale_price, execution_date, settlement_date, _pdf_ex_rate, fees_euro = parse_sale_pdf(sale_pdf)
+    fx_set = boi_eur_ils(execution_date.date())
+    print(f"[{date_key}] sale_price={sale_price}€, execution={execution_date.date()}, settle={settlement_date.date() if settlement_date else 'N/A'}, BoI FX={fx_set}, fees={fees_euro}€")
 
     # load the CSV
     df = pd.read_csv(
@@ -122,7 +126,8 @@ def process_pair(csv_path):
     # fetch BoI EUR/ILS rate for each unique acquisition date
     # Under ITO Section 91(b), the exchange rate substitutes for CPI on foreign-currency assets:
     # the inflationary component = cost×(fx_set/fx_acq − 1) and is tax-exempt; only the real
-    # gain above the FX movement is taxable.
+    # gain above the FX movement is taxable. Both fx_set (execution date) and fx_acq use the
+    # BoI representative rate, consistent with Form 1325 which asks for the sale date rate.
     unique_acq_dates = df["Acquisition date"].dt.date.unique()
     fx_cache = {}
     for d in unique_acq_dates:
