@@ -4,6 +4,7 @@
 import glob
 import os
 import re
+import sys
 from datetime import datetime
 import datetime as dt
 
@@ -14,7 +15,96 @@ import requests
 # ─── CONSTANT ────────────────────────────────────────────────────────────────
 TAX_RATE = 0.25  # 25%
 
-# ─── PARSE SALE PARAMETERS FROM PDF ────────────────────────────────────────────
+
+# ─── MOSES / FORM 1325 CAPITAL GAIN ALGORITHM ────────────────────────────────
+def moses_gain_loss(
+    original_cost_ils: float,
+    net_sale_ils: float,
+    fx_buy: float,
+    fx_sell: float,
+) -> tuple[float, float]:
+    """
+    Israeli capital-gain/loss calculation for foreign-currency securities per
+    ITO Section 91(b), Form 1325 (2025), and Circular 10/2025 (Moses rule).
+
+    Returns (taxable_gain, deductible_loss) both >= 0.
+
+    The FX rate acts as an index (מדד). When FX rises, the inflationary component
+    is exempt. When FX falls, the negative inflationary component is treated as
+    zero — it cannot enlarge a gain or convert a loss into a deductible amount.
+    """
+    adjusted_cost_ils = original_cost_ils * (fx_sell / fx_buy)
+    nominal_result = net_sale_ils - original_cost_ils
+
+    if nominal_result > 0:
+        if fx_sell >= fx_buy:
+            inflationary = adjusted_cost_ils - original_cost_ils  # >= 0
+            exempt = min(nominal_result, max(0.0, inflationary))
+            taxable_gain = nominal_result - exempt
+        else:
+            # FX fell: negative inflationary component treated as zero — no exemption
+            taxable_gain = nominal_result
+        deductible_loss = 0.0
+
+    elif nominal_result < 0:
+        taxable_gain = 0.0
+        nominal_loss = -nominal_result
+        if fx_sell >= fx_buy:
+            # FX rise cannot enlarge the loss; full nominal loss is deductible
+            deductible_loss = nominal_loss
+        else:
+            # Remove the portion of the loss attributable to FX decline
+            neg_inflationary = original_cost_ils - adjusted_cost_ils  # >= 0
+            deductible_loss = max(0.0, nominal_loss - neg_inflationary)
+            # equivalent: max(0.0, adjusted_cost_ils - net_sale_ils)
+
+    else:
+        taxable_gain = 0.0
+        deductible_loss = 0.0
+
+    return taxable_gain, deductible_loss
+
+
+# ─── UNIT TESTS (Circular 10/2025 examples, no fees) ─────────────────────────
+def _run_tests():
+    def check(label, orig, net_sale, fx_buy, fx_sell, exp_gain, exp_loss):
+        gain, loss = moses_gain_loss(orig, net_sale, fx_buy, fx_sell)
+        ok = abs(gain - exp_gain) < 0.01 and abs(loss - exp_loss) < 0.01
+        status = "PASS" if ok else "FAIL"
+        print(f"  [{status}] {label}: gain={gain:.2f} loss={loss:.2f} "
+              f"(expected gain={exp_gain} loss={exp_loss})")
+        if not ok:
+            raise AssertionError(f"Test failed: {label}")
+
+    print("Running Moses algorithm unit tests ...")
+
+    # 1. Price rises, FX rises → inflationary component exempt
+    # buy $1000 @ 3.4 → cost=3400; sell $1200 @ 3.7 → net=4440
+    # adjusted_cost=3700; nominal=1040; inflationary=300; taxable=740
+    check("FX up, price up", 3400, 4440, 3.4, 3.7, exp_gain=740, exp_loss=0)
+
+    # 2. Price falls, FX rises → full nominal loss deductible
+    # buy $1000 @ 3.4 → cost=3400; sell $800 @ 3.7 → net=2960; nominal=-440
+    check("FX up, price down (loss)", 3400, 2960, 3.4, 3.7, exp_gain=0, exp_loss=440)
+
+    # 2b. Price falls, FX rises sharply, FX gain > price loss → zero result
+    # buy $1000 @ 3.4 → cost=3400; sell $800 @ 5.0 → net=4000; nominal=+600
+    # adjusted_cost=5000; inflationary=1600; exempt=min(600,1600)=600; taxable=0
+    check("FX up big, price down (nominal gain, all inflationary)", 3400, 4000, 3.4, 5.0, exp_gain=0, exp_loss=0)
+
+    # 3. Price rises, FX falls → full nominal gain taxable (no exemption)
+    # buy $1000 @ 3.7 → cost=3700; sell $1200 @ 3.4 → net=4080; nominal=+380
+    check("FX down, price up", 3700, 4080, 3.7, 3.4, exp_gain=380, exp_loss=0)
+
+    # 4. Price falls, FX falls → partial loss deductible
+    # buy $1000 @ 3.7 → cost=3700; sell $900 @ 3.4 → net=3060; nominal=-640
+    # adjusted_cost=3400; neg_inflationary=300; deductible=max(0,640-300)=340
+    check("FX down, price down", 3700, 3060, 3.7, 3.4, exp_gain=0, exp_loss=340)
+
+    print("All tests passed.")
+
+
+# ─── PARSE SALE PARAMETERS FROM PDF ──────────────────────────────────────────
 def parse_sale_pdf(path):
     """
     Extract SALE_PRICE (€), execution date, settlement date, EX_RATE (ILS/€), FEES_EURO from sale_*.pdf.
@@ -50,6 +140,7 @@ def parse_sale_pdf(path):
             f"--- page text ---\n{text}"
         )
     return sale_price, execution_date, settlement_date, ex_rate, fees_euro
+
 
 # ─── BANK OF ISRAEL EUR/ILS RATE ─────────────────────────────────────────────
 def boi_eur_ils(day: str | dt.date, *, live: bool = False) -> float:
@@ -92,6 +183,7 @@ def boi_eur_ils(day: str | dt.date, *, live: bool = False) -> float:
             continue
     raise RuntimeError(f"No BoI EUR/ILS rate found within 7 days before {day}")
 
+
 # ─── PROCESS ONE CSV + ITS MATCHING SALE.PDF ─────────────────────────────────
 def process_pair(csv_path):
     # match the date key in the filename
@@ -107,46 +199,57 @@ def process_pair(csv_path):
 
     # parse that PDF, then fetch BoI FX rate on the execution (trade) date
     sale_price, execution_date, settlement_date, _pdf_ex_rate, fees_euro = parse_sale_pdf(sale_pdf)
-    fx_set = boi_eur_ils(execution_date.date())
-    print(f"[{date_key}] sale_price={sale_price}€, execution={execution_date.date()}, settle={settlement_date.date() if settlement_date else 'N/A'}, BoI FX={fx_set}, fees={fees_euro}€")
+    fx_sell = boi_eur_ils(execution_date.date())
+    print(f"[{date_key}] sale_price={sale_price}€, execution={execution_date.date()}, "
+          f"settle={settlement_date.date() if settlement_date else 'N/A'}, "
+          f"BoI FX(sell)={fx_sell}, fees={fees_euro}€")
 
     # load the CSV
-    df = pd.read_csv(
-        csv_path,
-        sep=";",
-        decimal=",",
-    )
+    df = pd.read_csv(csv_path, sep=";", decimal=",")
     df["Acquisition date"] = pd.to_datetime(df["Acquisition date"], format="%d %b %Y")
 
     # fetch BoI EUR/ILS rate for each unique acquisition date
-    # Under ITO Section 91(b), the exchange rate substitutes for CPI on foreign-currency assets:
-    # the inflationary component = cost×(fx_set/fx_acq − 1) and is tax-exempt; only the real
-    # gain above the FX movement is taxable. Both fx_set (execution date) and fx_acq use the
-    # BoI representative rate, consistent with Form 1325 which asks for the sale date rate.
     unique_acq_dates = df["Acquisition date"].dt.date.unique()
     fx_cache = {}
     for d in unique_acq_dates:
         fx_cache[d] = boi_eur_ils(d)
-        print(f"  Acq {d}: BoI FX = {fx_cache[d]}")
+        print(f"  Acq {d}: BoI FX(buy) = {fx_cache[d]}")
 
     df["FX_acq"] = df["Acquisition date"].dt.date.map(fx_cache)
 
-    # compute gain: convert both legs to ILS using their respective period's BoI FX rate
-    fees_shekels            = fees_euro * fx_set
-    df["gross_sale_shekel"] = df["Consumption"] * sale_price * fx_set
-    df["cost_shekel"]       = df["Consumption"] * df["Purchase price"] * df["FX_acq"]
+    # Per Form 1325:
+    #   original_cost = purchase value (no acquisition commission for RSU grants)
+    #   net_sale = gross_sale - allocated sale commission
+    #   gross_sale is kept separately as turnover (מחזור מכירות) for Form 1322
 
-    # allocate fees proportionally per lot by share count, deduct from gain before tax
-    df["fees_shekel_lot"]  = fees_shekels * (df["Consumption"] / df["Consumption"].sum())
-    df["real_gain_shekel"] = df["gross_sale_shekel"] - df["cost_shekel"] - df["fees_shekel_lot"]
-    df["tax_to_pay"]       = df["real_gain_shekel"].clip(lower=0) * TAX_RATE
+    fees_shekels = fees_euro * fx_sell
+    total_shares = df["Consumption"].sum()
 
-    # totals
+    df["original_cost_shekel"] = df["Consumption"] * df["Purchase price"] * df["FX_acq"]
+    df["gross_sale_shekel"]    = df["Consumption"] * sale_price * fx_sell
+    df["sale_fee_shekel_lot"]  = fees_shekels * (df["Consumption"] / total_shares)
+    df["net_sale_shekel"]      = df["gross_sale_shekel"] - df["sale_fee_shekel_lot"]
+    df["adjusted_cost_shekel"] = df["original_cost_shekel"] * (fx_sell / df["FX_acq"])
+
+    # Apply Moses 4-case algorithm per lot
+    gains, losses = zip(*df.apply(
+        lambda r: moses_gain_loss(
+            r["original_cost_shekel"],
+            r["net_sale_shekel"],
+            r["FX_acq"],
+            fx_sell,
+        ),
+        axis=1,
+    ))
+    df["taxable_gain_shekel"]    = list(gains)
+    df["deductible_loss_shekel"] = list(losses)
+
+    # Totals
     total_gross_sale_shekel = df["gross_sale_shekel"].sum()
-    total_gain              = df.loc[df["real_gain_shekel"] > 0, "real_gain_shekel"].sum()
-    total_loss              = df.loc[df["real_gain_shekel"] < 0, "real_gain_shekel"].sum()
-    total_real_gain         = total_gain + total_loss
-    total_tax_to_pay        = max(0.0, total_real_gain) * TAX_RATE
+    total_taxable_gain      = df["taxable_gain_shekel"].sum()
+    total_deductible_loss   = df["deductible_loss_shekel"].sum()
+    total_net_gain          = total_taxable_gain - total_deductible_loss
+    total_tax_to_pay        = max(0.0, total_net_gain) * TAX_RATE
 
     # write Data + Summary into two sheets
     out = csv_path.replace(".csv", "_with_calc.xlsx")
@@ -156,9 +259,9 @@ def process_pair(csv_path):
         summary = pd.DataFrame([{
             "Fees_shekels":             fees_shekels,
             "Total_gross_sale_shekel":  total_gross_sale_shekel,
-            "Total_gain_shekel":        total_gain,
-            "Total_loss_shekel":        total_loss,
-            "Total_real_gain_shekel":   total_real_gain,
+            "Total_taxable_gain":       total_taxable_gain,
+            "Total_deductible_loss":    total_deductible_loss,
+            "Total_net_gain":           total_net_gain,
             "Total_tax_to_pay":         total_tax_to_pay,
         }])
         summary.to_excel(writer, sheet_name="Summary", index=False)
@@ -166,14 +269,15 @@ def process_pair(csv_path):
     print(f"Wrote {out} (with summary sheet)")
 
     return {
-        "Sale date":                date_key,
-        "Fees_shekels":             fees_shekels,
-        "Total_gross_sale_shekel":  total_gross_sale_shekel,
-        "Total_gain_shekel":        total_gain,
-        "Total_loss_shekel":        total_loss,
-        "Total_real_gain_shekel":   total_real_gain,
-        "Total_tax_to_pay":         total_tax_to_pay,
+        "Sale date":               date_key,
+        "Fees_shekels":            fees_shekels,
+        "Total_gross_sale_shekel": total_gross_sale_shekel,
+        "Total_taxable_gain":      total_taxable_gain,
+        "Total_deductible_loss":   total_deductible_loss,
+        "Total_net_gain":          total_net_gain,
+        "Total_tax_to_pay":        total_tax_to_pay,
     }
+
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
@@ -187,15 +291,17 @@ def main():
         return
 
     summary_df = pd.DataFrame(rows).sort_values("Sale date")
-    net_annual_gain = summary_df["Total_real_gain_shekel"].sum()
+    total_taxable_gain    = summary_df["Total_taxable_gain"].sum()
+    total_deductible_loss = summary_df["Total_deductible_loss"].sum()
+    net_annual_gain       = total_taxable_gain - total_deductible_loss
     total_row = {
-        "Sale date":                "TOTAL",
-        "Fees_shekels":             summary_df["Fees_shekels"].sum(),
-        "Total_gross_sale_shekel":  summary_df["Total_gross_sale_shekel"].sum(),
-        "Total_gain_shekel":        summary_df["Total_gain_shekel"].sum(),
-        "Total_loss_shekel":        summary_df["Total_loss_shekel"].sum(),
-        "Total_real_gain_shekel":   net_annual_gain,
-        "Total_tax_to_pay":         max(0.0, net_annual_gain) * TAX_RATE,
+        "Sale date":               "TOTAL",
+        "Fees_shekels":            summary_df["Fees_shekels"].sum(),
+        "Total_gross_sale_shekel": summary_df["Total_gross_sale_shekel"].sum(),
+        "Total_taxable_gain":      total_taxable_gain,
+        "Total_deductible_loss":   total_deductible_loss,
+        "Total_net_gain":          net_annual_gain,
+        "Total_tax_to_pay":        max(0.0, net_annual_gain) * TAX_RATE,
     }
     summary_df = pd.concat([summary_df, pd.DataFrame([total_row])], ignore_index=True)
 
@@ -204,5 +310,9 @@ def main():
     summary_df.to_excel(out, index=False)
     print(f"\nWrote combined summary: {out}")
 
+
 if __name__ == "__main__":
-    main()
+    if "--test" in sys.argv:
+        _run_tests()
+    else:
+        main()

@@ -54,14 +54,14 @@ Parses an Interactive Brokers annual tax statement PDF and produces `tax_ibkr_su
 | Dividend total | Sum of all country dividend totals (includes Payments in Lieu of Dividends) |
 | Dividend + external income total | Dividend total (incl. Payments in Lieu) + interest income |
 | Foreign withholding tax | Pre-converted ILS total from IBKR Cash Report (positive — tax paid abroad) |
-| IBKR positive realized stock gains | S/T + L/T realized gains in ILS from Performance Summary |
-| IBKR realized stock losses | S/T + L/T realized losses in ILS from Performance Summary |
-| IBKR gross sale value (stock disposals) | Proceeds from actual stock sells only, converted via BoI rate on sale date |
-| EquatePlus positive realized gains | From `tax_summary_<year>.xlsx` TOTAL row (if file exists) |
-| EquatePlus realized losses | From `tax_summary_<year>.xlsx` TOTAL row |
+| IBKR taxable realized stock gains | Per-lot taxable gains per Moses/Form 1325 algorithm (ITO Section 91(b) + Circular 10/2025) |
+| IBKR deductible realized stock losses | Per-lot deductible losses per Moses/Form 1325 algorithm (positive number) |
+| IBKR gross sale value (stock disposals) | Proceeds from actual stock sells only (turnover / מחזור מכירות), converted via BoI rate on sale date |
+| EquatePlus taxable realized gains | From `tax_summary_<year>.xlsx` TOTAL row (if file exists) |
+| EquatePlus deductible realized losses | From `tax_summary_<year>.xlsx` TOTAL row (positive) |
 | EquatePlus gross sale value | From `tax_summary_<year>.xlsx` TOTAL row |
-| TOTAL positive realized gains | IBKR + EquatePlus combined |
-| TOTAL realized losses | IBKR + EquatePlus combined |
+| TOTAL taxable gains | IBKR + EquatePlus combined |
+| TOTAL deductible losses | IBKR + EquatePlus combined (positive) |
 | TOTAL gross sale value | IBKR + EquatePlus combined |
 
 All FX conversions use the Bank of Israel representative rate (walks back up to 7 days for weekends/holidays), consistent with ITO Section 91(b).

@@ -12,6 +12,42 @@ import pdfplumber
 import pandas as pd
 import requests
 
+
+def moses_gain_loss(
+    original_cost_ils: float,
+    net_sale_ils: float,
+    fx_buy: float,
+    fx_sell: float,
+) -> tuple[float, float]:
+    """
+    Israeli capital-gain/loss per ITO Section 91(b), Form 1325 (2025), Circular 10/2025.
+    Returns (taxable_gain, deductible_loss) both >= 0.
+    """
+    adjusted_cost_ils = original_cost_ils * (fx_sell / fx_buy)
+    nominal_result = net_sale_ils - original_cost_ils
+
+    if nominal_result > 0:
+        if fx_sell >= fx_buy:
+            inflationary = adjusted_cost_ils - original_cost_ils
+            exempt = min(nominal_result, max(0.0, inflationary))
+            taxable_gain = nominal_result - exempt
+        else:
+            taxable_gain = nominal_result
+        deductible_loss = 0.0
+    elif nominal_result < 0:
+        taxable_gain = 0.0
+        nominal_loss = -nominal_result
+        if fx_sell >= fx_buy:
+            deductible_loss = nominal_loss
+        else:
+            neg_inflationary = original_cost_ils - adjusted_cost_ils
+            deductible_loss = max(0.0, nominal_loss - neg_inflationary)
+    else:
+        taxable_gain = 0.0
+        deductible_loss = 0.0
+
+    return taxable_gain, deductible_loss
+
 ISIN_COUNTRY = {
     "US": "United States",
     "GB": "United Kingdom",
@@ -241,10 +277,10 @@ def parse_closed_lots_ils(text: str) -> tuple[int, int, int]:
     correctly handles symbols where net qty is 0 or positive (buy > sell) but
     actual disposals still occurred.
 
-    Returns (gains_ils, losses_ils, gross_sales_ils) all as rounded ints.
-    gains_ils  >= 0  (sum of profitable lots only)
-    losses_ils <= 0  (sum of loss lots only)
-    gross_sales_ils >= 0
+    Returns (taxable_gains_ils, deductible_losses_ils, gross_sales_ils) all as rounded ints.
+    taxable_gains_ils    >= 0  (sum of per-lot taxable gains)
+    deductible_losses_ils >= 0  (sum of per-lot deductible losses, stored positive)
+    gross_sales_ils >= 0  (turnover / מחזור מכירות for Form 1322)
     """
     # Parse all "Closed Lot:" lines with position
     lot_pattern = re.compile(
@@ -316,8 +352,8 @@ def parse_closed_lots_ils(text: str) -> tuple[int, int, int]:
     fill_positions = [f[0] for f in sell_fills_sorted]
 
     # Only process Total blocks that have closed lots (= had actual disposals)
-    total_gains = 0.0
-    total_losses = 0.0
+    total_taxable_gains    = 0.0
+    total_deductible_losses = 0.0
     total_gross = 0.0
 
     for i, total_pos in enumerate(total_positions):
@@ -328,41 +364,50 @@ def parse_closed_lots_ils(text: str) -> tuple[int, int, int]:
         # Find the sale date from sell fill rows within this block's text range.
         # A block spans from the previous Total (exclusive) to this Total (exclusive).
         block_start = total_positions[i - 1] if i > 0 else 0
-        # fills whose position falls in (block_start, total_pos)
         lo = bisect.bisect_right(fill_positions, block_start)
         hi = bisect.bisect_left(fill_positions, total_pos)
         block_fills = sell_fills_sorted[lo:hi]
         if not block_fills:
             raise RuntimeError(f"No sell fill date found for {sym} block at pos {total_pos}")
-        # Last fill date in the block wins (handles partial fills on same day)
         sale_date = block_fills[-1][1]
+
+        # Quantity reconciliation: closed lot quantities must sum to net sold qty
+        lot_total_qty = sum(l[1] for l in lots)
+        total_sold_qty = abs(qty)
+        if abs(lot_total_qty - total_sold_qty) > 0.01:
+            raise RuntimeError(
+                f"Lot qty mismatch for {sym}: closed lots sum to {lot_total_qty} "
+                f"but Total row shows net qty {total_sold_qty}"
+            )
 
         fx_sale = boi_ils(ccy, sale_date)
         gross_ils = proceeds_usd * fx_sale
         total_gross += gross_ils
 
-        lot_total_qty = sum(l[1] for l in lots)
         print(f"  {sale_date} {sym} ({ccy}): proceeds={proceeds_usd:.2f} "
               f"comm={comm_usd:.2f} fx_sale={fx_sale:.4f}")
 
         for acq_date, lot_qty, cost_per_share in lots:
             fx_acq = boi_ils(ccy, acq_date)
+            # IBKR cost_per_share already includes acquisition commission
+            original_cost_ils = lot_qty * cost_per_share * fx_acq
             lot_proceeds_usd = proceeds_usd * (lot_qty / lot_total_qty)
-            lot_gross_ils = lot_proceeds_usd * fx_sale
-            lot_cost_ils = lot_qty * cost_per_share * fx_acq
+            gross_lot_ils = lot_proceeds_usd * fx_sale
             lot_comm_ils = comm_usd * (lot_qty / lot_total_qty) * fx_sale
-            lot_gain_ils = lot_gross_ils - lot_cost_ils - lot_comm_ils
-            print(f"    lot acq={acq_date} qty={lot_qty} cost/sh=${cost_per_share:.4f} "
-                  f"fx_acq={fx_acq:.4f} → gain={lot_gain_ils:.2f} ILS")
-            if lot_gain_ils >= 0:
-                total_gains += lot_gain_ils
-            else:
-                total_losses += lot_gain_ils
+            net_sale_ils = gross_lot_ils - lot_comm_ils
+
+            taxable_gain, deductible_loss = moses_gain_loss(
+                original_cost_ils, net_sale_ils, fx_acq, fx_sale
+            )
+            total_taxable_gains += taxable_gain
+            total_deductible_losses += deductible_loss
+            print(f"    lot acq={acq_date} qty={lot_qty} cost/sh={cost_per_share:.4f} "
+                  f"fx_acq={fx_acq:.4f} → taxable={taxable_gain:.2f} loss={deductible_loss:.2f} ILS")
 
     if total_gross == 0:
         raise RuntimeError("No closed lot disposals found in PDF")
 
-    return round(total_gains), round(total_losses), round(total_gross)
+    return round(total_taxable_gains), round(total_deductible_losses), round(total_gross)
 
 
 def extract_year_from_filename(path: str) -> str:
@@ -379,8 +424,8 @@ def build_summary_rows(
     dividend_total: int,
     div_plus_income: int,
     wht_ils: int,
-    gains_ils: int,
-    losses_ils: int,
+    taxable_gains_ils: int,
+    deductible_losses_ils: int,
     gross_sales_ils: int,
 ) -> list[dict]:
     rows = [
@@ -393,8 +438,8 @@ def build_summary_rows(
         {"Label": "Dividend total", "Value (ILS)": dividend_total},
         {"Label": "Dividend + external income total", "Value (ILS)": div_plus_income},
         {"Label": "Foreign withholding tax", "Value (ILS)": wht_ils},
-        {"Label": "IBKR positive realized stock gains", "Value (ILS)": gains_ils},
-        {"Label": "IBKR realized stock losses", "Value (ILS)": losses_ils},
+        {"Label": "IBKR taxable realized stock gains", "Value (ILS)": taxable_gains_ils},
+        {"Label": "IBKR deductible realized stock losses", "Value (ILS)": deductible_losses_ils},
         {"Label": "IBKR gross sale value (stock disposals)", "Value (ILS)": gross_sales_ils},
     ]
     return rows
@@ -429,9 +474,9 @@ def main():
     wht_ils = parse_withholding_tax_ils(text)
     print(f"  WHT in ILS: {wht_ils}")
 
-    print("Parsing realized stock gains/losses and gross sales via closed lots (BoI FX rates) ...")
-    gains_ils, losses_ils, gross_sales_ils = parse_closed_lots_ils(text)
-    print(f"  Gains: {gains_ils}  Losses: {losses_ils}  Gross sales: {gross_sales_ils}")
+    print("Parsing realized stock gains/losses and gross sales via closed lots (Moses/Form 1325) ...")
+    taxable_gains_ils, deductible_losses_ils, gross_sales_ils = parse_closed_lots_ils(text)
+    print(f"  Taxable gains: {taxable_gains_ils}  Deductible losses: {deductible_losses_ils}  Gross sales: {gross_sales_ils}")
 
     rows = build_summary_rows(
         interest_ils=round(interest_exact),
@@ -439,8 +484,8 @@ def main():
         dividend_total=round(dividend_total_exact),
         div_plus_income=round(div_plus_income_exact),
         wht_ils=wht_ils,
-        gains_ils=gains_ils,
-        losses_ils=losses_ils,
+        taxable_gains_ils=taxable_gains_ils,
+        deductible_losses_ils=deductible_losses_ils,
         gross_sales_ils=gross_sales_ils,
     )
 
@@ -450,23 +495,23 @@ def main():
         print(f"\nFound {equate_summary_path}, adding EquatePlus + combined totals ...")
         eq_df = pd.read_excel(equate_summary_path)
         total_row = eq_df[eq_df["Sale date"] == "TOTAL"].iloc[0]
-        eq_gains  = round(float(total_row["Total_gain_shekel"]))
-        eq_losses = round(float(total_row["Total_loss_shekel"]))
+        eq_gains  = round(float(total_row["Total_taxable_gain"]))
+        eq_losses = round(float(total_row["Total_deductible_loss"]))
         eq_gross  = round(float(total_row["Total_gross_sale_shekel"]))
 
-        combined_gains  = gains_ils + eq_gains
-        combined_losses = losses_ils + eq_losses
+        combined_gains  = taxable_gains_ils + eq_gains
+        combined_losses = deductible_losses_ils + eq_losses
         combined_gross  = gross_sales_ils + eq_gross
 
         rows += [
             {"Label": "", "Value (ILS)": ""},
-            {"Label": "EquatePlus positive realized gains", "Value (ILS)": eq_gains},
-            {"Label": "EquatePlus realized losses",         "Value (ILS)": eq_losses},
-            {"Label": "EquatePlus gross sale value",        "Value (ILS)": eq_gross},
+            {"Label": "EquatePlus taxable realized gains",    "Value (ILS)": eq_gains},
+            {"Label": "EquatePlus deductible realized losses","Value (ILS)": eq_losses},
+            {"Label": "EquatePlus gross sale value",          "Value (ILS)": eq_gross},
             {"Label": "", "Value (ILS)": ""},
-            {"Label": "TOTAL positive realized gains (IBKR + EquatePlus)",  "Value (ILS)": combined_gains},
-            {"Label": "TOTAL realized losses (IBKR + EquatePlus)",          "Value (ILS)": combined_losses},
-            {"Label": "TOTAL gross sale value (IBKR + EquatePlus)",         "Value (ILS)": combined_gross},
+            {"Label": "TOTAL taxable gains (IBKR + EquatePlus)",       "Value (ILS)": combined_gains},
+            {"Label": "TOTAL deductible losses (IBKR + EquatePlus)",   "Value (ILS)": combined_losses},
+            {"Label": "TOTAL gross sale value (IBKR + EquatePlus)",    "Value (ILS)": combined_gross},
         ]
         print(f"  EquatePlus gains: {eq_gains}  losses: {eq_losses}  gross: {eq_gross}")
         print(f"  Combined gains: {combined_gains}  losses: {combined_losses}  gross: {combined_gross}")
