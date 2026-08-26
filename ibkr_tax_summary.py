@@ -86,19 +86,29 @@ def extract_dividends_text(pdf_path: str) -> str:
     return "\n".join(parts)
 
 
-def parse_interest_ils(pdf_path: str) -> int:
-    # Interest section is always on the last page, after the Dividends section.
+def parse_ibkr_totals_ils(pdf_path: str) -> tuple[float, float]:
+    """
+    Parse exact IBKR-computed ILS totals from the last page.
+    Returns (dividend_total_ils, interest_total_ils) as floats (not yet rounded).
+    """
     with pdfplumber.open(pdf_path) as pdf:
         last_page_text = pdf.pages[-1].extract_text() or ""
-    # Find the Interest section header then the "Total in ILS" that follows it
+
+    m = re.search(r"Total Dividends in ILS\s+([\d,]+\.\d+)", last_page_text)
+    if not m:
+        raise RuntimeError("Could not parse 'Total Dividends in ILS' from PDF")
+    dividend_total = float(m.group(1).replace(",", ""))
+
     m = re.search(
         r"\bInterest\b\s*\nDate Description Amount\b.*?Total in ILS\s+([\d,]+\.\d+)",
         last_page_text,
         re.DOTALL,
     )
-    if m:
-        return round(float(m.group(1).replace(",", "")))
-    raise RuntimeError("Could not parse interest ILS total from PDF")
+    if not m:
+        raise RuntimeError("Could not parse interest 'Total in ILS' from PDF")
+    interest_total = float(m.group(1).replace(",", ""))
+
+    return dividend_total, interest_total
 
 
 def parse_dividends_by_country(pdf_path: str) -> dict:
@@ -131,7 +141,7 @@ def parse_dividends_by_country(pdf_path: str) -> dict:
         print(f"  {date_str} {isin} ({country}) {ccy} {amount:.2f} @ {rate:.4f} = {amount*rate:.2f} ILS")
     if not by_country:
         raise RuntimeError("No dividend rows parsed from PDF")
-    return {country: round(total) for country, total in sorted(by_country.items())}
+    return {country: total for country, total in sorted(by_country.items())}
 
 
 def parse_withholding_tax_ils(text: str) -> int:
@@ -345,16 +355,16 @@ def main():
 
     text = extract_full_text(pdf_path)
 
-    print("Parsing interest ...")
-    interest_ils = parse_interest_ils(pdf_path)
-    print(f"  Interest in ILS: {interest_ils}")
+    print("Parsing IBKR exact dividend and interest totals ...")
+    dividend_total_exact, interest_exact = parse_ibkr_totals_ils(pdf_path)
+    print(f"  Total Dividends in ILS: {dividend_total_exact}")
+    print(f"  Total Interest in ILS:  {interest_exact}")
 
-    print("Parsing dividends by country ...")
+    print("Parsing dividends by country (for breakdown only) ...")
     dividends_by_country = parse_dividends_by_country(pdf_path)
-    dividend_total = sum(dividends_by_country.values())
-    div_plus_income = dividend_total + interest_ils
-    print(f"  Dividends by country: {dividends_by_country}")
-    print(f"  Dividend total: {dividend_total}")
+    div_plus_income_exact = dividend_total_exact + interest_exact
+    print(f"  Dividends by country: { {k: round(v) for k, v in dividends_by_country.items()} }")
+    print(f"  Dividend + interest total: {div_plus_income_exact}")
 
     print("Parsing withholding tax ...")
     wht_ils = parse_withholding_tax_ils(text)
@@ -365,10 +375,10 @@ def main():
     print(f"  Gains: {gains_ils}  Losses: {losses_ils}  Gross sales: {gross_sales_ils}")
 
     rows = build_summary_rows(
-        interest_ils=interest_ils,
-        dividends_by_country=dividends_by_country,
-        dividend_total=dividend_total,
-        div_plus_income=div_plus_income,
+        interest_ils=round(interest_exact),
+        dividends_by_country={k: round(v) for k, v in dividends_by_country.items()},
+        dividend_total=round(dividend_total_exact),
+        div_plus_income=round(div_plus_income_exact),
         wht_ils=wht_ils,
         gains_ils=gains_ils,
         losses_ils=losses_ils,
