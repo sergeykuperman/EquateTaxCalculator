@@ -20,9 +20,32 @@ ISIN_COUNTRY = {
     "IE": "Ireland",
     "CA": "Canada",
     "DE": "Germany",
+    "DK": "Denmark",
     "FR": "France",
     "NL": "Netherlands",
     "CH": "Switzerland",
+}
+
+# Map IBKR 2-letter withholding tax country code → country name
+_WHT_COUNTRY_CODE = {
+    "US": "United States",
+    "GB": "United Kingdom",
+    "NL": "Netherlands",
+    "DK": "Denmark",
+    "DE": "Germany",
+    "FR": "France",
+    "CH": "Switzerland",
+    "IE": "Ireland",
+    "CA": "Canada",
+    "AU": "Australia",
+    "JP": "Japan",
+    "SE": "Sweden",
+    "NO": "Norway",
+    "FI": "Finland",
+    "IT": "Italy",
+    "ES": "Spain",
+    "BE": "Belgium",
+    "AT": "Austria",
 }
 
 _fx_cache = {}
@@ -86,6 +109,35 @@ def extract_dividends_text(pdf_path: str) -> str:
     return "\n".join(parts)
 
 
+def parse_ticker_tax_country(pdf_path: str) -> dict:
+    """
+    Build ticker → tax-source country name from IBKR withholding labels.
+
+    On the two-column WHT/Dividend pages, the left column contains lines like:
+      2024-02-15 AAPL(US0378331005) Cash Dividend USD 0.24 per Share - US Tax -4.08
+      2024-08-01 ASML(USN07059210A) Cash Dividend USD 1.23 per Share - NL Tax -12.34
+
+    We extract "- XX Tax" from those lines to get the authoritative tax country,
+    which takes priority over the ISIN prefix (important for ADRs like ASML).
+    """
+    wht_pattern = re.compile(
+        r"([A-Z0-9]+)\([A-Z]{2}[A-Z0-9]+\).*?-\s+([A-Z]{2})\s+Tax"
+    )
+    ticker_country = {}
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            if "Withholding Tax" not in text or "Dividends" not in text:
+                continue
+            left = page.crop((0, 0, page.width * 0.5, page.height))
+            for line in (left.extract_text() or "").splitlines():
+                m = wht_pattern.search(line)
+                if m:
+                    ticker, code = m.group(1), m.group(2)
+                    country = _WHT_COUNTRY_CODE.get(code, code)
+                    ticker_country[ticker] = country
+    return ticker_country
+
 def parse_ibkr_totals_ils(pdf_path: str) -> tuple[float, float]:
     """
     Parse exact IBKR-computed ILS totals from the last page.
@@ -111,14 +163,13 @@ def parse_ibkr_totals_ils(pdf_path: str) -> tuple[float, float]:
     return dividend_total, interest_total
 
 
-def parse_dividends_by_country(pdf_path: str) -> dict:
+def parse_dividends_by_country(pdf_path: str, ticker_tax_country: dict) -> dict:
     # Extract clean dividends-only text from right column of two-column pages
     div_text = extract_dividends_text(pdf_path)
 
     # Each entry spans 2-3 lines:
     #   Line 1: TICKER(ISIN) description [currency] [per share info]
     #   Line 2: DATE  amount
-    #   Line 3: (Dividend type)  [optional, wrapped]
     # We anchor on the ISIN pattern and grab the date+amount from the next line.
     pattern = re.compile(
         r"([A-Z0-9]+)\(([A-Z]{2}[A-Z0-9]+)\)\s+"
@@ -131,14 +182,18 @@ def parse_dividends_by_country(pdf_path: str) -> dict:
     )
     by_country = defaultdict(float)
     for m in pattern.finditer(div_text):
-        _ticker, isin, _ptype, currency, date_str, amount_str = m.groups()
-        isin_prefix = isin[:2].upper()
-        country = ISIN_COUNTRY.get(isin_prefix, isin_prefix)
+        ticker, isin, _ptype, currency, date_str, amount_str = m.groups()
+        # Priority: IBKR explicit WHT country > ISIN prefix > raw prefix
+        if ticker in ticker_tax_country:
+            country = ticker_tax_country[ticker]
+        else:
+            isin_prefix = isin[:2].upper()
+            country = ISIN_COUNTRY.get(isin_prefix, isin_prefix)
         ccy = (currency or "USD").upper()
         amount = float(amount_str.replace(",", ""))
         rate = boi_ils(ccy, date_str)
         by_country[country] += amount * rate
-        print(f"  {date_str} {isin} ({country}) {ccy} {amount:.2f} @ {rate:.4f} = {amount*rate:.2f} ILS")
+        print(f"  {date_str} {ticker}/{isin} ({country}) {ccy} {amount:.2f} @ {rate:.4f} = {amount*rate:.2f} ILS")
     if not by_country:
         raise RuntimeError("No dividend rows parsed from PDF")
     return {country: total for country, total in sorted(by_country.items())}
@@ -361,7 +416,8 @@ def main():
     print(f"  Total Interest in ILS:  {interest_exact}")
 
     print("Parsing dividends by country (for breakdown only) ...")
-    dividends_by_country = parse_dividends_by_country(pdf_path)
+    ticker_tax_country = parse_ticker_tax_country(pdf_path)
+    dividends_by_country = parse_dividends_by_country(pdf_path, ticker_tax_country)
     div_plus_income_exact = dividend_total_exact + interest_exact
     print(f"  Dividends by country: { {k: round(v) for k, v in dividends_by_country.items()} }")
     print(f"  Dividend + interest total: {div_plus_income_exact}")
