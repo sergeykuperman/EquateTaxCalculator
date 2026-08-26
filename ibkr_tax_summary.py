@@ -162,6 +162,122 @@ def parse_realized_stocks_ils(text: str) -> tuple[int, int]:
     return round(gains), round(losses)
 
 
+def parse_closed_lots_ils(text: str) -> tuple[int, int, int]:
+    """
+    Reconstruct realized gains/losses and gross sale value from closed lot data
+    using BoI FX rates on both sale date and acquisition date, consistent with
+    Form 1325 methodology (same as tax_calculator.py for EquatePlus).
+
+    Returns (gains_ils, losses_ils, gross_sales_ils) all as rounded ints.
+    gains_ils  >= 0  (sum of profitable lots only)
+    losses_ils <= 0  (sum of loss lots only)
+    gross_sales_ils >= 0
+    """
+    # For each sold symbol, the PDF provides:
+    #   - A "Total SYMBOL" row with net qty (negative = sell), total proceeds, total commission
+    #   - One or more "Closed Lot: ACQ_DATE qty cost_per_share lot_basis realized_pl TERM" lines
+    #     that appear after the individual fill rows
+    #
+    # We use "Total SYMBOL" for proceeds/commission (avoids double-counting partial fills),
+    # and "Closed Lot" lines for per-lot acquisition date and cost per share.
+
+    # Step 1: find all "Total SYMBOL" rows with negative net qty
+    total_pattern = re.compile(
+        r"^Total ([A-Z]+)\s+(-\d[\d,]*)\s+([\d,]+\.\d+)\s+([-\d.]+)",
+        re.MULTILINE,
+    )
+    # Step 2: find all "Closed Lot" lines with their text position
+    lot_pattern = re.compile(
+        r"^Closed Lot:\s+(\d{4}-\d{2}-\d{2})\s+"
+        r"([\d.]+)\s+"           # qty
+        r"([\d.]+)\s+"           # cost per share (USD)
+        r"([\d,]+\.\d+)\s+"      # lot basis (USD) — not used, recalculated
+        r"([-\d,]+\.\d+)",       # lot realized P/L — not used, recalculated
+        re.MULTILINE,
+    )
+    # Step 3: find sale date for each sold symbol (last C-coded fill before Total)
+    sell_date_pattern = re.compile(
+        r"(\d{4}-\d{2}-\d{2}),\s*\n"
+        r"([A-Z]+)\s+\S+\s+-\d+\s+[\d.]+\s+[\d.]+\s+[\d,]+\.\d+\s+"
+        r"[-\d.]+\s+[-\d,]+\.\d+\s+[-\d,]+\.\d+\s+[-\d,]+\.\d+\s+C",
+        re.MULTILINE,
+    )
+    symbol_sale_date = {}
+    for m in sell_date_pattern.finditer(text):
+        symbol_sale_date[m.group(2)] = m.group(1)
+
+    # Collect all closed lot positions
+    lots_with_pos = [(m.start(), m.group(1), float(m.group(2)),
+                      float(m.group(3)), float(m.group(4).replace(",", "")))
+                     for m in lot_pattern.finditer(text)]
+
+    # Collect total row positions for sold symbols
+    totals_with_pos = []
+    for m in total_pattern.finditer(text):
+        symbol = m.group(1)
+        qty = int(m.group(2).replace(",", ""))
+        if qty >= 0:
+            continue
+        proceeds = float(m.group(3).replace(",", ""))
+        comm = abs(float(m.group(4)))
+        totals_with_pos.append((m.start(), symbol, qty, proceeds, comm))
+
+    if not totals_with_pos:
+        raise RuntimeError("No sold symbols found in Trades section")
+
+    # Associate closed lots with their symbol: a lot belongs to the nearest preceding Total row
+    # (lots appear between the fill rows and the Total row for each symbol)
+    # Sort totals by position
+    totals_with_pos.sort(key=lambda x: x[0])
+
+    # Build symbol -> list of closed lots by finding lots that fall before each Total row
+    # and after the previous Total row
+    symbol_lots = {}
+    prev_boundary = 0
+    for total_pos, symbol, qty, proceeds, comm in totals_with_pos:
+        lots = [(acq_date, lot_qty, cost_per_share)
+                for pos, acq_date, lot_qty, cost_per_share, _ in lots_with_pos
+                if prev_boundary < pos < total_pos]
+        symbol_lots[symbol] = (qty, proceeds, comm, lots)
+        prev_boundary = total_pos
+
+    # Step 4: compute per-lot gain/loss using BoI rates
+    total_gains = 0.0
+    total_losses = 0.0
+    total_gross = 0.0
+
+    for symbol, (net_qty, total_proceeds_usd, total_comm_usd, lots) in symbol_lots.items():
+        sale_date = symbol_sale_date.get(symbol)
+        if not sale_date:
+            raise RuntimeError(f"No sale date found for symbol {symbol}")
+        if not lots:
+            raise RuntimeError(f"No closed lots found for symbol {symbol}")
+
+        fx_sale = boi_ils("USD", sale_date)
+        gross_ils = total_proceeds_usd * fx_sale
+        total_gross += gross_ils
+
+        lot_total_qty = sum(l[1] for l in lots)
+        print(f"  {sale_date} {symbol}: proceeds=${total_proceeds_usd:.2f} "
+              f"comm=${total_comm_usd:.2f} fx_sale={fx_sale:.4f}")
+
+        for acq_date, lot_qty, cost_per_share in lots:
+            fx_acq = boi_ils("USD", acq_date)
+            lot_proceeds_usd = total_proceeds_usd * (lot_qty / lot_total_qty)
+            lot_gross_ils = lot_proceeds_usd * fx_sale
+            lot_cost_ils = lot_qty * cost_per_share * fx_acq
+            lot_comm_ils = total_comm_usd * (lot_qty / lot_total_qty) * fx_sale
+            lot_gain_ils = lot_gross_ils - lot_cost_ils - lot_comm_ils
+            print(f"    lot acq={acq_date} qty={lot_qty} cost/sh=${cost_per_share:.4f} "
+                  f"fx_acq={fx_acq:.4f} → gain={lot_gain_ils:.2f} ILS")
+            if lot_gain_ils >= 0:
+                total_gains += lot_gain_ils
+            else:
+                total_losses += lot_gain_ils
+
+    return round(total_gains), round(total_losses), round(total_gross)
+
+
 def parse_gross_sales_ils(text: str) -> int:
     # Use "Total SYMBOL" rows: negative net qty = net sell position.
     # We need the sale date; find the last trade date for each sold symbol.
@@ -269,13 +385,9 @@ def main():
     wht_ils = parse_withholding_tax_ils(text)
     print(f"  WHT in ILS: {wht_ils}")
 
-    print("Parsing realized stock gains/losses ...")
-    gains_ils, losses_ils = parse_realized_stocks_ils(text)
-    print(f"  Gains: {gains_ils}  Losses: {losses_ils}")
-
-    print("Parsing gross sales ...")
-    gross_sales_ils = parse_gross_sales_ils(text)
-    print(f"  Gross sales in ILS: {gross_sales_ils}")
+    print("Parsing realized stock gains/losses and gross sales via closed lots (BoI FX rates) ...")
+    gains_ils, losses_ils, gross_sales_ils = parse_closed_lots_ils(text)
+    print(f"  Gains: {gains_ils}  Losses: {losses_ils}  Gross sales: {gross_sales_ils}")
 
     rows = build_summary_rows(
         interest_ils=interest_ils,
