@@ -182,8 +182,8 @@ def parse_closed_lots_ils(text: str) -> tuple[int, int, int]:
     lot_pattern = re.compile(
         r"^Closed Lot:\s+(\d{4}-\d{2}-\d{2})\s+"
         r"([\d.]+)\s+"           # qty
-        r"([\d.]+)\s+"           # cost per share (USD)
-        r"([\d,]+\.\d+)\s+"      # lot basis (USD) — not used, recalculated
+        r"([\d.]+)\s+"           # cost per share
+        r"([\d,]+\.\d+)\s+"      # lot basis — not used, recalculated
         r"([-\d,]+\.\d+)",       # lot realized P/L — not used, recalculated
         re.MULTILINE,
     )
@@ -199,6 +199,8 @@ def parse_closed_lots_ils(text: str) -> tuple[int, int, int]:
         r"[-\d.]+\s+[-\d,]+\.\d+\s+[-\d,]+\.\d+\s+[-\d,]+\.\d+\s+C",
         re.MULTILINE,
     )
+    # Currency section headers: a line that is exactly a 3-letter currency code
+    currency_header_pattern = re.compile(r"^(USD|EUR|GBP|CAD|CHF|JPY|AUD)$", re.MULTILINE)
 
     # Build position-sorted lists
     lots_pos = [(m.start(), m.group(1), float(m.group(2)),
@@ -209,6 +211,12 @@ def parse_closed_lots_ils(text: str) -> tuple[int, int, int]:
                   for m in total_pattern.finditer(text)]
     sell_fills = [(m.start(), m.group(1), m.group(2))  # (pos, date, symbol)
                   for m in sell_fill_pattern.finditer(text)]
+    # currency headers sorted by position: [(pos, currency), ...]
+    currency_headers = sorted(
+        [(m.start(), m.group(1)) for m in currency_header_pattern.finditer(text)],
+        key=lambda x: x[0],
+    )
+    ccy_positions = [c[0] for c in currency_headers]
 
     if not lots_pos:
         raise RuntimeError("No Closed Lot lines found in PDF")
@@ -218,8 +226,12 @@ def parse_closed_lots_ils(text: str) -> tuple[int, int, int]:
     # Group lots by that Total row (identified by its position).
     totals_pos_sorted = sorted(totals_pos, key=lambda x: x[0])
 
-    # Build: total_pos -> (symbol, qty, proceeds, comm, [lots])
-    total_blocks = {pos: (sym, qty, proc, comm, [])
+    # Build: total_pos -> (symbol, qty, proceeds, comm, currency, [lots])
+    def _block_currency(pos):
+        idx = bisect.bisect_right(ccy_positions, pos) - 1
+        return currency_headers[idx][1] if idx >= 0 else "USD"
+
+    total_blocks = {pos: (sym, qty, proc, comm, _block_currency(pos), [])
                     for pos, sym, qty, proc, comm in totals_pos_sorted}
     total_positions = sorted(total_blocks.keys())
 
@@ -229,7 +241,7 @@ def parse_closed_lots_ils(text: str) -> tuple[int, int, int]:
         if idx >= len(total_positions):
             continue  # lot after last Total — shouldn't happen
         owner_pos = total_positions[idx]
-        total_blocks[owner_pos][4].append((acq_date, lot_qty, cost_per_share))
+        total_blocks[owner_pos][5].append((acq_date, lot_qty, cost_per_share))
 
     # sell_fills sorted by position for per-block date lookup
     sell_fills_sorted = sorted(sell_fills, key=lambda x: x[0])
@@ -241,7 +253,7 @@ def parse_closed_lots_ils(text: str) -> tuple[int, int, int]:
     total_gross = 0.0
 
     for i, total_pos in enumerate(total_positions):
-        sym, qty, proceeds_usd, comm_usd, lots = total_blocks[total_pos]
+        sym, qty, proceeds_usd, comm_usd, ccy, lots = total_blocks[total_pos]
         if not lots:
             continue  # no disposals in this symbol block
 
@@ -257,16 +269,16 @@ def parse_closed_lots_ils(text: str) -> tuple[int, int, int]:
         # Last fill date in the block wins (handles partial fills on same day)
         sale_date = block_fills[-1][1]
 
-        fx_sale = boi_ils("USD", sale_date)
+        fx_sale = boi_ils(ccy, sale_date)
         gross_ils = proceeds_usd * fx_sale
         total_gross += gross_ils
 
         lot_total_qty = sum(l[1] for l in lots)
-        print(f"  {sale_date} {sym}: proceeds=${proceeds_usd:.2f} "
-              f"comm=${comm_usd:.2f} fx_sale={fx_sale:.4f}")
+        print(f"  {sale_date} {sym} ({ccy}): proceeds={proceeds_usd:.2f} "
+              f"comm={comm_usd:.2f} fx_sale={fx_sale:.4f}")
 
         for acq_date, lot_qty, cost_per_share in lots:
-            fx_acq = boi_ils("USD", acq_date)
+            fx_acq = boi_ils(ccy, acq_date)
             lot_proceeds_usd = proceeds_usd * (lot_qty / lot_total_qty)
             lot_gross_ils = lot_proceeds_usd * fx_sale
             lot_cost_ils = lot_qty * cost_per_share * fx_acq
