@@ -144,7 +144,7 @@ def process_pair(csv_path):
     # allocate fees proportionally per lot by share count, deduct from gain before tax
     df["fees_shekel_lot"]  = fees_shekels * (df["Consumption"] / df["Consumption"].sum())
     df["real_gain_shekel"] = df["gross_sale_shekel"] - df["cost_shekel"] - df["fees_shekel_lot"]
-    df["tax_to_pay"]       = df["real_gain_shekel"] * TAX_RATE
+    df["tax_to_pay"]       = df["real_gain_shekel"].clip(lower=0) * TAX_RATE
 
     # totals
     total_gross_sale_shekel = df["gross_sale_shekel"].sum()
