@@ -231,24 +231,31 @@ def parse_closed_lots_ils(text: str) -> tuple[int, int, int]:
         owner_pos = total_positions[idx]
         total_blocks[owner_pos][4].append((acq_date, lot_qty, cost_per_share))
 
-    # Build symbol -> sale_date from sell fill rows (last date wins per symbol)
-    symbol_sale_date = {}
-    for _, date_str, symbol in sell_fills:
-        symbol_sale_date[symbol] = date_str
+    # sell_fills sorted by position for per-block date lookup
+    sell_fills_sorted = sorted(sell_fills, key=lambda x: x[0])
+    fill_positions = [f[0] for f in sell_fills_sorted]
 
     # Only process Total blocks that have closed lots (= had actual disposals)
     total_gains = 0.0
     total_losses = 0.0
     total_gross = 0.0
 
-    for total_pos in total_positions:
+    for i, total_pos in enumerate(total_positions):
         sym, qty, proceeds_usd, comm_usd, lots = total_blocks[total_pos]
         if not lots:
             continue  # no disposals in this symbol block
 
-        sale_date = symbol_sale_date.get(sym)
-        if not sale_date:
-            raise RuntimeError(f"No sell fill date found for symbol {sym}")
+        # Find the sale date from sell fill rows within this block's text range.
+        # A block spans from the previous Total (exclusive) to this Total (exclusive).
+        block_start = total_positions[i - 1] if i > 0 else 0
+        # fills whose position falls in (block_start, total_pos)
+        lo = bisect.bisect_right(fill_positions, block_start)
+        hi = bisect.bisect_left(fill_positions, total_pos)
+        block_fills = sell_fills_sorted[lo:hi]
+        if not block_fills:
+            raise RuntimeError(f"No sell fill date found for {sym} block at pos {total_pos}")
+        # Last fill date in the block wins (handles partial fills on same day)
+        sale_date = block_fills[-1][1]
 
         fx_sale = boi_ils("USD", sale_date)
         gross_ils = proceeds_usd * fx_sale
