@@ -188,7 +188,7 @@ def main():
         if row:
             rows.append(row)
 
-    if len(rows) < 2:
+    if not rows:
         return
 
     summary_df = pd.DataFrame(rows).sort_values("Sale date")
