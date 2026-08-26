@@ -18,7 +18,6 @@ import hashlib
 import os
 
 import pandas as pd
-from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
 from tax_utils import _round_ils
@@ -179,42 +178,46 @@ def main():
     print(f"  Combined: gains={combined_gains}  losses={combined_losses}  gross={combined_gross}")
 
     # IBKR income parsing (dividends, interest, WHT)
+    wbook_path = f"form1325_support_{year}.xlsx"
+    ibkr_pdf = None
     if args.ibkr_pdf:
+        if not os.path.exists(args.ibkr_pdf):
+            raise SystemExit(f"--ibkr-pdf not found: {args.ibkr_pdf}")
         ibkr_pdf = args.ibkr_pdf
-        if not os.path.exists(ibkr_pdf):
-            raise SystemExit(f"--ibkr-pdf not found: {ibkr_pdf}")
     else:
         pdfs = glob.glob("*_tax_statement.pdf")
-        if not pdfs:
-            raise SystemExit(
-                "No *_tax_statement.pdf found. Use --ibkr-pdf PATH or place the file in the current directory."
-            )
         if len(pdfs) > 1:
             raise SystemExit(f"Expected exactly 1 *_tax_statement.pdf, found {len(pdfs)}: {pdfs}. Use --ibkr-pdf.")
-        ibkr_pdf = pdfs[0]
+        if pdfs:
+            ibkr_pdf = pdfs[0]
 
-    # Verify IBKR PDF against the hash recorded in the 1325 workbook Sources sheet
-    wbook_path = f"form1325_support_{year}.xlsx"
-    _verify_ibkr_pdf_hash(ibkr_pdf, wbook_path)
+    if ibkr_pdf:
+        _verify_ibkr_pdf_hash(ibkr_pdf, wbook_path)
 
-    print(f"\nParsing dividends from {ibkr_pdf} ...")
-    ticker_tax_country = parse_ticker_tax_country(ibkr_pdf)
-    dividends_by_country = parse_dividends_by_country(ibkr_pdf, ticker_tax_country)
-    dividend_total = sum(dividends_by_country.values())
+        print(f"\nParsing dividends from {ibkr_pdf} ...")
+        ticker_tax_country = parse_ticker_tax_country(ibkr_pdf)
+        dividends_by_country = parse_dividends_by_country(ibkr_pdf, ticker_tax_country)
+        dividend_total = sum(dividends_by_country.values())
 
-    print("Parsing interest income ...")
-    interest_total = parse_interest_transactions_ils(ibkr_pdf)
+        print("Parsing interest income ...")
+        interest_total = parse_interest_transactions_ils(ibkr_pdf)
 
-    print("Parsing withholding tax ...")
-    text = extract_full_text(ibkr_pdf)
-    wht_ils = parse_withholding_tax_ils(text)
+        print("Parsing withholding tax ...")
+        text = extract_full_text(ibkr_pdf)
+        wht_ils = parse_withholding_tax_ils(text)
+
+        print(f"  Dividends: { {k: _round_ils(v) for k, v in dividends_by_country.items()} }")
+        print(f"  Dividend total: {_round_ils(dividend_total)}")
+        print(f"  Interest total: {_round_ils(interest_total)}")
+        print(f"  WHT: {wht_ils}")
+    else:
+        print("\nNo IBKR PDF found — dividends, interest, and withholding tax will be zero.")
+        dividends_by_country = {}
+        dividend_total = 0.0
+        interest_total = 0.0
+        wht_ils = 0
 
     div_plus_income = dividend_total + interest_total
-
-    print(f"  Dividends: { {k: _round_ils(v) for k, v in dividends_by_country.items()} }")
-    print(f"  Dividend total: {_round_ils(dividend_total)}")
-    print(f"  Interest total: {_round_ils(interest_total)}")
-    print(f"  WHT: {wht_ils}")
 
     # Build summary rows
     summary_rows = [
@@ -262,7 +265,7 @@ def main():
         provenance_pairs = [
             ("source_1325_workbook", wbook_path),
             ("sha256_1325_workbook", wbook_hash),
-            ("ibkr_pdf",             os.path.basename(ibkr_pdf)),
+            ("ibkr_pdf",             os.path.basename(ibkr_pdf) if ibkr_pdf else "none"),
             ("generation_timestamp", datetime.datetime.now().isoformat(timespec="seconds")),
         ]
         for key, val in provenance_pairs:
@@ -271,6 +274,12 @@ def main():
 
     print(f"Done. Wrote {out}")
     print(f"  1325 workbook hash recorded in Provenance: {wbook_hash[:16]}...")
+    if not ibkr_pdf:
+        print(
+            "\n  WARNING: No IBKR PDF was supplied or found. "
+            "Interest income, dividends, and withholding tax are recorded as zero. "
+            "If you have IBKR income, re-run with: --ibkr-pdf <path>"
+        )
 
 
 if __name__ == "__main__":
