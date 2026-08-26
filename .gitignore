@@ -5,6 +5,9 @@ sale_*.pdf
 tax_summary_*.xlsx
 portfolio_projection_5y.xlsx
 
+# integration test fixtures (contain personal financial data — never commit)
+tests/integration/fixtures/
+
 # Windows NTFS alternate data streams
 *:Zone.Identifier
 
