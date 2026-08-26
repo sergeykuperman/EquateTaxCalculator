@@ -34,26 +34,21 @@ def parse_sale_pdf(path):
     m = re.search(r"Settlement date:\s*([\d]{1,2}\s+[A-Za-z]+\s+\d{4})", text)
     settlement_date = datetime.strptime(m.group(1), "%d %b %Y") if m else None
 
-    # EX_RATE: look for number with 5 decimals after "Foreign exchange"
+    # EX_RATE: 5-decimal number after "Foreign exchange"
     m = re.search(r"Foreign exchange[\s\S]*?(\d+\.\d{5})", text)
-    if not m:
-        # fallback to any 5-decimal number on the page
-        m = re.search(r"\b(\d+\.\d{5})\b", text)
     ex_rate = float(m.group(1)) if m else None
 
-    # FEES_EURO: look for "Total debits" line with a two-decimal euro amount
+    # FEES_EURO: "Total debits" line with a two-decimal euro amount
     m = re.search(r"Total debits[\s\S]*?(\d+\.\d{2})\s*(?:€|EUR)", text)
-    if not m:
-        # fallback to any two-decimal number under 100
-        m = re.search(r"\b([0-9]{1,2}\.\d{2})\b", text)
     fees_euro = float(m.group(1)) if m else None
 
     if None in (sale_price, execution_date, ex_rate, fees_euro):
-        raise RuntimeError(f"Failed to parse all sale params from {path}:\n"
-                           f" sale_price={sale_price}, "
-                           f"execution={execution_date}, "
-                           f"FX={ex_rate}, "
-                           f"fees={fees_euro}")
+        raise RuntimeError(
+            f"Failed to parse all sale params from {path}:\n"
+            f" sale_price={sale_price}, execution={execution_date}, "
+            f"FX={ex_rate}, fees={fees_euro}\n"
+            f"--- page text ---\n{text}"
+        )
     return sale_price, execution_date, settlement_date, ex_rate, fees_euro
 
 # ─── BANK OF ISRAEL EUR/ILS RATE ─────────────────────────────────────────────
