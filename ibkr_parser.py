@@ -88,6 +88,36 @@ TOTAL_PATTERN = re.compile(
 
 CURRENCY_HEADER_PATTERN = re.compile(r"^(USD|EUR|GBP|CAD|CHF|JPY|AUD)$", re.MULTILINE)
 
+# ─── CORPORATE ACTION PATTERNS ───────────────────────────────────────────────
+
+# Numbers line for a CA disposal: report_date eff_date,time qty proceeds value realized_pl
+# Matches only negative qty (disposal) — zero-proceeds rows (splits/spinoffs) have positive qty
+CA_DISPOSAL_NUMS_PATTERN = re.compile(
+    r"\d{4}-\d{2}-\d{2}\s+"            # report date (discard)
+    r"(\d{4}-\d{2}-\d{2}),\s*"         # effective date (capture)
+    r"\d{2}:\d{2}:\d{2}\s+"            # time (discard)
+    r"(-[\d,]+(?:\.\d+)?)\s+"          # negative quantity (disposal)
+    r"([\d,]+\.\d+)\s+"                # proceeds (positive)
+    r"[-\d,]+\.\d+\s+"                 # value (skip)
+    r"([-\d,]+\.\d+)",                  # realized P/L
+)
+
+# TICKER(ISIN) — used to find the ticker from the description line preceding the numbers line
+CA_TICKER_PATTERN = re.compile(r"([A-Z][A-Z0-9]*)\([^\)]+\)")
+
+# Closed Lot line under a Corporate Action: acq_date, basis, lot_qty, lot_realized_pl, term
+CA_LOT_PATTERN = re.compile(
+    r"Closed Lot:\s+(\d{4}-\d{2}-\d{2})\s+"
+    r"Basis:\s+([\d,]+\.\d+)\s+"
+    r"([\d,]+(?:\.\d+)?)\s+"
+    r"([-\d,]+\.\d+)\s+"
+    r"(ST|LT)",
+)
+
+# Section boundary patterns for isolating the CA section and finding Total lines within it
+CA_SECTION_START = re.compile(r"Corporate Actions")
+CA_TOTAL_PATTERN = re.compile(r"^Total\b", re.MULTILINE)
+
 
 # ─── TEXT EXTRACTION ─────────────────────────────────────────────────────────
 
@@ -106,23 +136,154 @@ def extract_year_from_filename(path: str) -> str:
 
 # ─── CAPITAL-GAINS LOT PARSER (raw broker facts — no Moses, no ILS conversion) ──
 
-def parse_ibkr_lots_detail(text: str) -> list[dict]:
+def parse_ibkr_corporate_action_lots(text: str) -> list[dict]:
     """
-    Parse all closed lot disposals from IBKR Trades section text.
+    Parse taxable stock disposals from the IBKR Corporate Actions section.
 
-    Returns one dict per closed acquisition lot with raw broker facts only.
-    No ILS conversion, no Moses calculation — those happen in capital_gains.py.
+    Handles cash corporate actions (mergers, acquisitions, tender offers) where the
+    disposition is recorded as a negative-quantity row with positive proceeds and one or
+    more associated Closed Lot records carrying per-lot Basis and realized P/L.
 
-    Each dict contains:
-        source, ticker, isin, currency, quantity, acquisition_date, sale_date,
-        exchange, acquisition_basis_fc, cost_per_share_fc,
-        gross_sale_proceeds_fc, sale_commission_fc (signed: negative=cost),
-        fill_id, lot_id, fill_seq, lot_seq
+    Lot proceeds are reconstructed exactly as:
+        lot_proceeds_fc = lot_basis_fc + lot_realized_pl_fc
+    NOT allocated proportionally by quantity — this preserves per-lot Moses accuracy
+    when multiple acquisition lots at different dates are closed in one corporate action.
 
-    Fails loudly on:
-    - C-coded fill with no Closed Lot lines
-    - Lot qty mismatch for any fill
-    - Aggregate qty/proceeds/commission mismatch for partial fills
+    Zero-proceeds events (splits, spinoffs) are silently skipped.
+    A taxable disposal (negative qty, positive proceeds) with no Closed Lot records
+    raises RuntimeError — cost basis is required to compute capital gains.
+
+    IDs:
+        fill_id = IBKR/CA/{effective_date}/{ticker}/{ca_seq}
+        lot_id  = {fill_id}/LOT/{lot_seq}
+    """
+    # Isolate the Corporate Actions section
+    ca_match = CA_SECTION_START.search(text)
+    if not ca_match:
+        return []
+    ca_section = text[ca_match.start():]
+
+    # Build currency block lookup within the CA section
+    ca_currency_headers = sorted(
+        [(m.start(), m.group(1)) for m in CURRENCY_HEADER_PATTERN.finditer(ca_section)],
+        key=lambda x: x[0],
+    )
+    ca_ccy_positions = [c[0] for c in ca_currency_headers]
+
+    def _ca_block_currency(pos: int) -> str:
+        idx = bisect.bisect_right(ca_ccy_positions, pos) - 1
+        return ca_currency_headers[idx][1] if idx >= 0 else "USD"
+
+    # Find all CA Total line positions (used as window boundaries)
+    total_positions = sorted(m.start() for m in CA_TOTAL_PATTERN.finditer(ca_section))
+
+    ca_seq_counter: dict = defaultdict(int)
+    result_rows = []
+
+    for m in CA_DISPOSAL_NUMS_PATTERN.finditer(ca_section):
+        effective_date = m.group(1)
+        parent_qty     = float(m.group(2).replace(",", ""))   # negative
+        parent_proc    = float(m.group(3).replace(",", ""))   # positive
+        parent_rpl     = float(m.group(4).replace(",", ""))
+
+        # Skip zero-proceeds events (splits, spinoffs, non-cash)
+        if parent_proc == 0.0:
+            continue
+
+        # Find the ticker: last TICKER(ISIN) match before this numbers line
+        preceding = ca_section[:m.start()]
+        ticker_matches = list(CA_TICKER_PATTERN.finditer(preceding))
+        if not ticker_matches:
+            raise RuntimeError(
+                f"Corporate action disposal on {effective_date} (qty={parent_qty}, "
+                f"proc={parent_proc}) has no preceding TICKER(ISIN) — cannot identify security"
+            )
+        sym = ticker_matches[-1].group(1)
+
+        # Find Closed Lot lines in the window between this match and the next Total line
+        window_start = m.end()
+        idx_total = bisect.bisect_right(total_positions, window_start)
+        window_end = total_positions[idx_total] if idx_total < len(total_positions) else len(ca_section)
+        window = ca_section[window_start:window_end]
+
+        lots = list(CA_LOT_PATTERN.finditer(window))
+        if not lots:
+            raise RuntimeError(
+                f"Corporate action disposal for {sym} on {effective_date} has positive proceeds "
+                f"({parent_proc}) but no Closed Lot records — cannot compute cost basis"
+            )
+
+        # Reconstruct per-lot proceeds from basis + realized P/L (not proportional allocation)
+        lot_data = []
+        for lot in lots:
+            acq_date  = lot.group(1)
+            basis_fc  = float(lot.group(2).replace(",", ""))
+            lot_qty   = float(lot.group(3).replace(",", ""))
+            lot_rpl   = float(lot.group(4).replace(",", ""))
+            lot_proc  = basis_fc + lot_rpl
+            lot_data.append((acq_date, basis_fc, lot_qty, lot_rpl, lot_proc))
+
+        # Validate fill-level invariants
+        total_qty  = sum(d[2] for d in lot_data)
+        total_rpl  = sum(d[3] for d in lot_data)
+        total_proc = sum(d[4] for d in lot_data)
+
+        if abs(total_qty - abs(parent_qty)) > 0.01:
+            raise RuntimeError(
+                f"Quantity mismatch for {sym} CA on {effective_date}: "
+                f"lots sum to {total_qty} but parent row shows {abs(parent_qty)}"
+            )
+        if abs(total_rpl - parent_rpl) > 0.02:
+            raise RuntimeError(
+                f"Realized P/L mismatch for {sym} CA on {effective_date}: "
+                f"lots sum to {total_rpl:.2f} but parent row shows {parent_rpl:.2f}"
+            )
+        if abs(total_proc - parent_proc) > 0.02:
+            raise RuntimeError(
+                f"Proceeds mismatch for {sym} CA on {effective_date}: "
+                f"reconstructed {total_proc:.2f} but parent row shows {parent_proc:.2f}"
+            )
+
+        ccy = _ca_block_currency(m.start())
+        key = (effective_date, sym)
+        ca_seq_counter[key] += 1
+        ca_seq = ca_seq_counter[key]
+        fill_id = f"IBKR/CA/{effective_date}/{sym}/{ca_seq}"
+
+        print(f"  CA {effective_date} {sym} ({ccy}): proceeds={parent_proc:.2f} "
+              f"rpl={parent_rpl:.2f} fill_id={fill_id}")
+
+        for lot_seq, (acq_date, basis_fc, lot_qty, lot_rpl, lot_proc) in enumerate(lot_data, start=1):
+            lot_id = f"{fill_id}/LOT/{lot_seq}"
+            result_rows.append({
+                "source":                 "IBKR",
+                "ticker":                 sym,
+                "isin":                   "",
+                "currency":               ccy,
+                "exchange":               "CA",
+                "quantity":               lot_qty,
+                "acquisition_date":       acq_date,
+                "sale_date":              effective_date,
+                "acquisition_basis_fc":   basis_fc,
+                "cost_per_share_fc":      basis_fc / lot_qty if lot_qty else 0.0,
+                "gross_sale_proceeds_fc": lot_proc,
+                "sale_commission_fc":     0.0,
+                "fill_quantity_fc":       total_qty,
+                "fill_proceeds_fc":       total_proc,
+                "fill_commission_fc":     0.0,
+                "fill_id":                fill_id,
+                "lot_id":                 lot_id,
+                "fill_seq":               ca_seq,
+                "lot_seq":                lot_seq,
+            })
+
+    return result_rows
+
+
+def _parse_trade_lots(text: str) -> list[dict]:
+    """
+    Parse closed lot disposals from the IBKR Trades section (C-coded fills).
+    Returns empty list if none found — combined check is in parse_ibkr_lots_detail().
     """
     lots_pos = [
         (m.start(), m.group(1), float(m.group(2)), float(m.group(3)),
@@ -153,10 +314,8 @@ def parse_ibkr_lots_detail(text: str) -> list[dict]:
     )
     ccy_positions = [c[0] for c in currency_headers]
 
-    if not lots_pos:
-        raise RuntimeError("No Closed Lot lines found in PDF")
-    if not child_fills:
-        raise RuntimeError("No child C-coded fill rows found in PDF")
+    if not lots_pos or not child_fills:
+        return []
 
     def _block_currency(pos):
         idx = bisect.bisect_right(ccy_positions, pos) - 1
@@ -278,9 +437,27 @@ def parse_ibkr_lots_detail(text: str) -> list[dict]:
             })
 
     if not result_rows:
-        raise RuntimeError("No closed lot disposals found in PDF")
+        return []
 
     return result_rows
+
+
+def parse_ibkr_lots_detail(text: str) -> list[dict]:
+    """
+    Parse all taxable IBKR stock disposals: normal Trades (C-coded fills) and
+    Corporate Action disposals (mergers, acquisitions, tender offers).
+
+    Returns one dict per closed acquisition lot with raw broker facts only.
+    No ILS conversion, no Moses calculation — those happen in capital_gains.py.
+
+    Raises RuntimeError if neither source produces any lots.
+    """
+    trade_lots = _parse_trade_lots(text)
+    ca_lots    = parse_ibkr_corporate_action_lots(text)
+    all_lots   = trade_lots + ca_lots
+    if not all_lots:
+        raise RuntimeError("No taxable IBKR stock disposals found in PDF")
+    return all_lots
 
 
 # ─── INCOME PARSERS (return ILS amounts — not capital gains, not via capital_gains.py) ──
