@@ -37,12 +37,18 @@ import pytest
 
 # ─── VERIFIED 2022 REGRESSION FIXTURES ───────────────────────────────────────
 # All values verified against real 2022 source files on 2026-08-26.
+# Do not change without re-running the pipeline and manually reviewing the output.
 
-EXPECTED_BRG_QUANTITY    = 300.0
-EXPECTED_BRG_PROCEEDS_FC = 7275.00
-EXPECTED_BRG_BASIS_FC    = 1432.04
-EXPECTED_BRG_ACQ_DATE    = "2020-04-09"
-EXPECTED_BRG_SALE_DATE   = "2022-10-10"
+EXPECTED_LOT_COUNT        = 1
+EXPECTED_TICKER           = "BRG"
+EXPECTED_QUANTITY         = 300.0
+EXPECTED_BASIS_FC         = 1432.04
+EXPECTED_PROCEEDS_FC      = 7275.00
+EXPECTED_ACQ_DATE         = "2020-04-09"
+EXPECTED_SALE_DATE        = "2022-10-10"
+# ILS values use BoI rates for 2020-04-09 (acq) and 2022-10-10 (sale) — NOT IBKR's ₪20,903.20
+EXPECTED_TAXABLE_GAIN_ILS   = 20483   # taxable_gain_ils_filing; exact = 20483.30
+EXPECTED_GROSS_TURNOVER_ILS = 25644   # _round_ils(gross_sale_proceeds_ils_exact = 25644.375)
 
 # ─── FIXTURE HELPERS ─────────────────────────────────────────────────────────
 
@@ -115,26 +121,44 @@ def test_2022_brg_corporate_action_lot():
         wb_path  = _run_generate(tmp, ibkr_pdf)
         df = pd.read_excel(wb_path, sheet_name="Tax Data")
 
-        assert len(df) == 1, f"Expected exactly 1 lot row, got {len(df)}"
+        assert len(df) == EXPECTED_LOT_COUNT, f"Expected {EXPECTED_LOT_COUNT} lot row(s), got {len(df)}"
         row = df.iloc[0]
 
-        assert row["ticker"]   == "BRG",               f"ticker: {row['ticker']}"
-        assert row["currency"] == "USD",                f"currency: {row['currency']}"
-        assert abs(row["quantity"] - EXPECTED_BRG_QUANTITY) < 0.01, f"quantity: {row['quantity']}"
-        assert row["acquisition_date"] == EXPECTED_BRG_ACQ_DATE,  f"acq_date: {row['acquisition_date']}"
-        assert row["sale_date"]        == EXPECTED_BRG_SALE_DATE,  f"sale_date: {row['sale_date']}"
-        assert abs(row["gross_sale_proceeds_fc"] - EXPECTED_BRG_PROCEEDS_FC) < 0.02, (
+        assert row["ticker"]   == EXPECTED_TICKER,   f"ticker: {row['ticker']}"
+        assert row["currency"] == "USD",              f"currency: {row['currency']}"
+        assert abs(row["quantity"] - EXPECTED_QUANTITY) < 0.01,  f"quantity: {row['quantity']}"
+        assert row["acquisition_date"] == EXPECTED_ACQ_DATE,     f"acq_date: {row['acquisition_date']}"
+        assert row["sale_date"]        == EXPECTED_SALE_DATE,     f"sale_date: {row['sale_date']}"
+        assert abs(row["gross_sale_proceeds_fc"] - EXPECTED_PROCEEDS_FC) < 0.02, (
             f"proceeds_fc: {row['gross_sale_proceeds_fc']}"
         )
-        assert abs(row["acquisition_basis_fc"] - EXPECTED_BRG_BASIS_FC) < 0.02, (
+        assert abs(row["acquisition_basis_fc"] - EXPECTED_BASIS_FC) < 0.02, (
             f"basis_fc: {row['acquisition_basis_fc']}"
         )
         assert abs(row["sale_commission_fc"]) < 0.001, f"commission should be 0: {row['sale_commission_fc']}"
 
         # fill_id must use CA namespace
-        assert row["fill_id"].startswith("IBKR/CA/"), f"fill_id: {row['fill_id']}"
         assert row["fill_id"] == "IBKR/CA/2022-10-10/BRG/1", f"fill_id: {row['fill_id']}"
         assert row["lot_id"]  == "IBKR/CA/2022-10-10/BRG/1/LOT/1", f"lot_id: {row['lot_id']}"
+
+
+@pytest.mark.integration
+@_skip
+def test_2022_ils_totals():
+    """Taxable gain and gross turnover in ILS match verified 2022 values."""
+    from tax_utils import _round_ils
+    with tempfile.TemporaryDirectory() as tmp:
+        ibkr_pdf = _copy_fixtures_to(tmp)
+        wb_path  = _run_generate(tmp, ibkr_pdf)
+        df = pd.read_excel(wb_path, sheet_name="Tax Data")
+
+        gain  = int(df["taxable_gain_ils_filing"].sum())
+        loss  = int(df["deductible_loss_ils_filing"].sum())
+        gross = _round_ils(df["gross_sale_proceeds_ils_exact"].sum())
+
+        assert gain  == EXPECTED_TAXABLE_GAIN_ILS,   f"taxable gain ILS: got {gain}"
+        assert loss  == 0,                            f"deductible loss ILS: got {loss}"
+        assert gross == EXPECTED_GROSS_TURNOVER_ILS, f"gross turnover ILS: got {gross}"
 
 
 @pytest.mark.integration

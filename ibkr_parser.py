@@ -465,16 +465,12 @@ def parse_ibkr_lots_detail(text: str) -> list[dict]:
 def _extract_dividends_text(pdf_path: str) -> str:
     parts = []
     with pdfplumber.open(pdf_path) as pdf:
-        total = len(pdf.pages)
-        for i, page in enumerate(pdf.pages):
+        for page in pdf.pages:
             text = page.extract_text() or ""
-            if "Withholding Tax" in text and "Dividends" in text:
-                right = page.crop((page.width * 0.5, 0, page.width, page.height))
-                parts.append(right.extract_text() or "")
-            elif "Dividends" in text and i == total - 1:
-                parts.append(text)
-            elif i == total - 1:
-                parts.append(text)
+            if "Dividends" not in text:
+                continue
+            right = page.crop((page.width * 0.5, 0, page.width, page.height))
+            parts.append(right.extract_text() or "")
     return "\n".join(parts)
 
 
@@ -498,64 +494,90 @@ def parse_ticker_tax_country(pdf_path: str) -> dict:
 
 def parse_dividends_by_country(pdf_path: str, ticker_tax_country: dict) -> dict:
     div_text = _extract_dividends_text(pdf_path)
-    pattern = re.compile(
-        r"([A-Z0-9]+)\(([A-Z]{2}[A-Z0-9]+)\)\s+"
+    # Split-line format: TICKER (ISIN) description\nDATE amount
+    # Allows space before '(' (e.g. "BEPC (CA...)") and numeric ISINs (e.g. BEP partnership "114646358")
+    split_pattern = re.compile(
+        r"([A-Z][A-Z0-9]*)\s*\(([A-Z0-9]+)\)\s+"
         r"(Cash Dividend|Payment in Lieu of Dividend)"
         r"(?:\s+(USD|GBP|EUR)\s+[\d.]+\s+per\s+Share)?"
         r"[^\n]*\n"
         r"(\d{4}-\d{2}-\d{2})\s+"
-        r"([\d,]+\.\d+)",
+        r"(-?[\d,]+\.\d+)",
         re.MULTILINE,
     )
-    by_country: dict = defaultdict(float)
-    for m in pattern.finditer(div_text):
-        ticker, isin, _ptype, currency, date_str, amount_str = m.groups()
+    # Inline format: DATE TICKER(ISIN) description amount (all on one line)
+    inline_pattern = re.compile(
+        r"^(\d{4}-\d{2}-\d{2})\s+"
+        r"([A-Z][A-Z0-9]*)\s*\(([A-Z0-9]+)\)\s+"
+        r"(Cash Dividend|Payment in Lieu of Dividend)"
+        r"[^\n]*\s+(-?[\d,]+\.\d+)$",
+        re.MULTILINE,
+    )
+
+    def _country(ticker: str, isin: str) -> str:
         if ticker in ticker_tax_country:
-            country = ticker_tax_country[ticker]
-        else:
-            country = ISIN_COUNTRY.get(isin[:2].upper(), isin[:2].upper())
+            return ticker_tax_country[ticker]
+        prefix = isin[:2].upper()
+        if prefix.isalpha():
+            return ISIN_COUNTRY.get(prefix, prefix)
+        return "United States"  # numeric ISIN = US partnership
+
+    by_country: dict = defaultdict(float)
+    matched_spans: set = set()
+
+    for m in split_pattern.finditer(div_text):
+        for pos in range(m.start(), m.end()):
+            matched_spans.add(pos)
+        ticker, isin, _ptype, currency, date_str, amount_str = m.groups()
+        country = _country(ticker, isin)
         ccy = (currency or "USD").upper()
         amount = float(amount_str.replace(",", ""))
         rate = boi_ils(ccy, date_str)
         by_country[country] += amount * rate
         print(f"  {date_str} {ticker}/{isin} ({country}) {ccy} {amount:.2f} @ {rate:.4f} = {amount*rate:.2f} ILS")
+
+    for m in inline_pattern.finditer(div_text):
+        if m.start() in matched_spans:
+            continue
+        date_str, ticker, isin, _ptype, amount_str = m.groups()
+        country = _country(ticker, isin)
+        amount = float(amount_str.replace(",", ""))
+        rate = boi_ils("USD", date_str)
+        by_country[country] += amount * rate
+        print(f"  {date_str} {ticker}/{isin} ({country}) USD {amount:.2f} @ {rate:.4f} = {amount*rate:.2f} ILS [inline]")
+
     if not by_country:
         raise RuntimeError("No dividend rows parsed from PDF")
     return {country: total for country, total in sorted(by_country.items())}
 
 
 def parse_interest_transactions_ils(pdf_path: str) -> float:
-    """Parse individual interest transactions from last page; convert each at per-transaction BoI rate."""
-    with pdfplumber.open(pdf_path) as pdf:
-        last_text = pdf.pages[-1].extract_text() or ""
-
-    lines = last_text.splitlines()
-    in_interest = False
+    """Parse interest transactions from left column of all Interest pages; convert at per-transaction BoI rate."""
+    row_pattern = re.compile(r"^(\d{4}-\d{2}-\d{2})\s+(USD|EUR|GBP|CAD|CHF|JPY|AUD)\s+.+\s+([\d,]+\.\d+)$")
     total = 0.0
-    row_pattern = re.compile(r"^(\d{4}-\d{2}-\d{2})\s+(\S+)\s+.+\s+([\d,]+\.\d+)$")
-    ccy_header = re.compile(r"^(USD|EUR|GBP|CAD|CHF|JPY|AUD)$")
-    current_ccy = "USD"
-    for line in lines:
-        if line.strip() == "Interest":
-            in_interest = True
-            continue
-        if not in_interest:
-            continue
-        if line.startswith("Total"):
-            break
-        m_ccy = ccy_header.match(line.strip())
-        if m_ccy:
-            current_ccy = m_ccy.group(1)
-            continue
-        m = row_pattern.match(line.strip())
-        if m:
-            date_str, ccy_inline, amount_str = m.group(1), m.group(2), m.group(3)
-            ccy = ccy_inline if ccy_inline in {"USD", "EUR", "GBP", "CAD", "CHF", "JPY", "AUD"} else current_ccy
-            amount = float(amount_str.replace(",", ""))
-            rate = boi_ils(ccy, date_str)
-            ils = amount * rate
-            total += ils
-            print(f"  {date_str} {ccy} interest {amount:.2f} @ {rate:.4f} = {ils:.2f} ILS")
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            if "Interest" not in (page.extract_text() or ""):
+                continue
+            left = page.crop((0, 0, page.width * 0.5, page.height))
+            in_interest = False
+            for line in (left.extract_text() or "").splitlines():
+                s = line.strip()
+                if s == "Interest":
+                    in_interest = True
+                    continue
+                if not in_interest:
+                    continue
+                if "Total Interest in ILS" in s:
+                    break
+                m = row_pattern.match(s)
+                if m:
+                    date_str, ccy, amount_str = m.groups()
+                    amount = float(amount_str.replace(",", ""))
+                    rate = boi_ils(ccy, date_str)
+                    ils = amount * rate
+                    total += ils
+                    print(f"  {date_str} {ccy} interest {amount:.2f} @ {rate:.4f} = {ils:.2f} ILS")
     return total
 
 
