@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import bisect
 import glob
 import os
 import re
@@ -168,25 +169,16 @@ def parse_closed_lots_ils(text: str) -> tuple[int, int, int]:
     using BoI FX rates on both sale date and acquisition date, consistent with
     Form 1325 methodology (same as tax_calculator.py for EquatePlus).
 
+    Anchors on "Closed Lot:" lines as the primary signal of a disposal — this
+    correctly handles symbols where net qty is 0 or positive (buy > sell) but
+    actual disposals still occurred.
+
     Returns (gains_ils, losses_ils, gross_sales_ils) all as rounded ints.
     gains_ils  >= 0  (sum of profitable lots only)
     losses_ils <= 0  (sum of loss lots only)
     gross_sales_ils >= 0
     """
-    # For each sold symbol, the PDF provides:
-    #   - A "Total SYMBOL" row with net qty (negative = sell), total proceeds, total commission
-    #   - One or more "Closed Lot: ACQ_DATE qty cost_per_share lot_basis realized_pl TERM" lines
-    #     that appear after the individual fill rows
-    #
-    # We use "Total SYMBOL" for proceeds/commission (avoids double-counting partial fills),
-    # and "Closed Lot" lines for per-lot acquisition date and cost per share.
-
-    # Step 1: find all "Total SYMBOL" rows with negative net qty
-    total_pattern = re.compile(
-        r"^Total ([A-Z]+)\s+(-\d[\d,]*)\s+([\d,]+\.\d+)\s+([-\d.]+)",
-        re.MULTILINE,
-    )
-    # Step 2: find all "Closed Lot" lines with their text position
+    # Parse all "Closed Lot:" lines with position
     lot_pattern = re.compile(
         r"^Closed Lot:\s+(\d{4}-\d{2}-\d{2})\s+"
         r"([\d.]+)\s+"           # qty
@@ -195,78 +187,83 @@ def parse_closed_lots_ils(text: str) -> tuple[int, int, int]:
         r"([-\d,]+\.\d+)",       # lot realized P/L — not used, recalculated
         re.MULTILINE,
     )
-    # Step 3: find sale date for each sold symbol (last C-coded fill before Total)
-    sell_date_pattern = re.compile(
+    # Parse all "Total SYMBOL qty proceeds comm ..." rows (any qty sign)
+    total_pattern = re.compile(
+        r"^Total ([A-Z]+)\s+(-?\d[\d,]*)\s+([\d,]+\.\d+)\s+([-\d.]+)",
+        re.MULTILINE,
+    )
+    # Parse all sell fill rows (negative qty, C-coded) for sale date
+    sell_fill_pattern = re.compile(
         r"(\d{4}-\d{2}-\d{2}),\s*\n"
         r"([A-Z]+)\s+\S+\s+-\d+\s+[\d.]+\s+[\d.]+\s+[\d,]+\.\d+\s+"
         r"[-\d.]+\s+[-\d,]+\.\d+\s+[-\d,]+\.\d+\s+[-\d,]+\.\d+\s+C",
         re.MULTILINE,
     )
+
+    # Build position-sorted lists
+    lots_pos = [(m.start(), m.group(1), float(m.group(2)),
+                 float(m.group(3)), float(m.group(4).replace(",", "")))
+                for m in lot_pattern.finditer(text)]
+    totals_pos = [(m.start(), m.group(1), int(m.group(2).replace(",", "")),
+                   float(m.group(3).replace(",", "")), abs(float(m.group(4))))
+                  for m in total_pattern.finditer(text)]
+    sell_fills = [(m.start(), m.group(1), m.group(2))  # (pos, date, symbol)
+                  for m in sell_fill_pattern.finditer(text)]
+
+    if not lots_pos:
+        raise RuntimeError("No Closed Lot lines found in PDF")
+
+    # For each closed lot, find its owning symbol block:
+    # The lot belongs to the nearest "Total SYMBOL" that comes AFTER the lot's position.
+    # Group lots by that Total row (identified by its position).
+    totals_pos_sorted = sorted(totals_pos, key=lambda x: x[0])
+
+    # Build: total_pos -> (symbol, qty, proceeds, comm, [lots])
+    total_blocks = {pos: (sym, qty, proc, comm, [])
+                    for pos, sym, qty, proc, comm in totals_pos_sorted}
+    total_positions = sorted(total_blocks.keys())
+
+    for lot_pos, acq_date, lot_qty, cost_per_share, _ in lots_pos:
+        # Find the first Total row position that is after this lot
+        idx = bisect.bisect_right(total_positions, lot_pos)
+        if idx >= len(total_positions):
+            continue  # lot after last Total — shouldn't happen
+        owner_pos = total_positions[idx]
+        total_blocks[owner_pos][4].append((acq_date, lot_qty, cost_per_share))
+
+    # Build symbol -> sale_date from sell fill rows (last date wins per symbol)
     symbol_sale_date = {}
-    for m in sell_date_pattern.finditer(text):
-        symbol_sale_date[m.group(2)] = m.group(1)
+    for _, date_str, symbol in sell_fills:
+        symbol_sale_date[symbol] = date_str
 
-    # Collect all closed lot positions
-    lots_with_pos = [(m.start(), m.group(1), float(m.group(2)),
-                      float(m.group(3)), float(m.group(4).replace(",", "")))
-                     for m in lot_pattern.finditer(text)]
-
-    # Collect total row positions for sold symbols
-    totals_with_pos = []
-    for m in total_pattern.finditer(text):
-        symbol = m.group(1)
-        qty = int(m.group(2).replace(",", ""))
-        if qty >= 0:
-            continue
-        proceeds = float(m.group(3).replace(",", ""))
-        comm = abs(float(m.group(4)))
-        totals_with_pos.append((m.start(), symbol, qty, proceeds, comm))
-
-    if not totals_with_pos:
-        raise RuntimeError("No sold symbols found in Trades section")
-
-    # Associate closed lots with their symbol: a lot belongs to the nearest preceding Total row
-    # (lots appear between the fill rows and the Total row for each symbol)
-    # Sort totals by position
-    totals_with_pos.sort(key=lambda x: x[0])
-
-    # Build symbol -> list of closed lots by finding lots that fall before each Total row
-    # and after the previous Total row
-    symbol_lots = {}
-    prev_boundary = 0
-    for total_pos, symbol, qty, proceeds, comm in totals_with_pos:
-        lots = [(acq_date, lot_qty, cost_per_share)
-                for pos, acq_date, lot_qty, cost_per_share, _ in lots_with_pos
-                if prev_boundary < pos < total_pos]
-        symbol_lots[symbol] = (qty, proceeds, comm, lots)
-        prev_boundary = total_pos
-
-    # Step 4: compute per-lot gain/loss using BoI rates
+    # Only process Total blocks that have closed lots (= had actual disposals)
     total_gains = 0.0
     total_losses = 0.0
     total_gross = 0.0
 
-    for symbol, (net_qty, total_proceeds_usd, total_comm_usd, lots) in symbol_lots.items():
-        sale_date = symbol_sale_date.get(symbol)
-        if not sale_date:
-            raise RuntimeError(f"No sale date found for symbol {symbol}")
+    for total_pos in total_positions:
+        sym, qty, proceeds_usd, comm_usd, lots = total_blocks[total_pos]
         if not lots:
-            raise RuntimeError(f"No closed lots found for symbol {symbol}")
+            continue  # no disposals in this symbol block
+
+        sale_date = symbol_sale_date.get(sym)
+        if not sale_date:
+            raise RuntimeError(f"No sell fill date found for symbol {sym}")
 
         fx_sale = boi_ils("USD", sale_date)
-        gross_ils = total_proceeds_usd * fx_sale
+        gross_ils = proceeds_usd * fx_sale
         total_gross += gross_ils
 
         lot_total_qty = sum(l[1] for l in lots)
-        print(f"  {sale_date} {symbol}: proceeds=${total_proceeds_usd:.2f} "
-              f"comm=${total_comm_usd:.2f} fx_sale={fx_sale:.4f}")
+        print(f"  {sale_date} {sym}: proceeds=${proceeds_usd:.2f} "
+              f"comm=${comm_usd:.2f} fx_sale={fx_sale:.4f}")
 
         for acq_date, lot_qty, cost_per_share in lots:
             fx_acq = boi_ils("USD", acq_date)
-            lot_proceeds_usd = total_proceeds_usd * (lot_qty / lot_total_qty)
+            lot_proceeds_usd = proceeds_usd * (lot_qty / lot_total_qty)
             lot_gross_ils = lot_proceeds_usd * fx_sale
             lot_cost_ils = lot_qty * cost_per_share * fx_acq
-            lot_comm_ils = total_comm_usd * (lot_qty / lot_total_qty) * fx_sale
+            lot_comm_ils = comm_usd * (lot_qty / lot_total_qty) * fx_sale
             lot_gain_ils = lot_gross_ils - lot_cost_ils - lot_comm_ils
             print(f"    lot acq={acq_date} qty={lot_qty} cost/sh=${cost_per_share:.4f} "
                   f"fx_acq={fx_acq:.4f} → gain={lot_gain_ils:.2f} ILS")
@@ -275,51 +272,10 @@ def parse_closed_lots_ils(text: str) -> tuple[int, int, int]:
             else:
                 total_losses += lot_gain_ils
 
+    if total_gross == 0:
+        raise RuntimeError("No closed lot disposals found in PDF")
+
     return round(total_gains), round(total_losses), round(total_gross)
-
-
-def parse_gross_sales_ils(text: str) -> int:
-    # Use "Total SYMBOL" rows: negative net qty = net sell position.
-    # We need the sale date; find the last trade date for each sold symbol.
-    # All sells in this statement are on 2024-01-31, but parse dynamically.
-
-    # Step 1: find all trade dates per symbol (date appears before the first trade row)
-    # Step 2: find Total rows with negative qty (net sells)
-    # Step 3: use the date of the last close trade for that symbol
-
-    # Build a map: symbol -> most recent sell date
-    close_date_pattern = re.compile(
-        r"(\d{4}-\d{2}-\d{2}),\s*\n"
-        r"([A-Z]+)\s+\S+\s+-\d+\s+[\d.]+\s+[\d.]+\s+[\d,]+\.\d+\s+"
-        r"[-\d.]+\s+[-\d,]+\.\d+\s+[-\d,]+\.\d+\s+[-\d,]+\.\d+\s+C",
-        re.MULTILINE,
-    )
-    symbol_date = {}
-    for m in close_date_pattern.finditer(text):
-        symbol_date[m.group(2)] = m.group(1)  # last date wins
-
-    # Find Total SYMBOL rows with negative net qty (net sell)
-    total_pattern = re.compile(
-        r"^Total ([A-Z]+)\s+(-\d[\d,]*)\s+([\d,]+\.\d+)",
-        re.MULTILINE,
-    )
-    total_ils = 0.0
-    for m in total_pattern.finditer(text):
-        symbol, qty_str, proceeds_str = m.group(1), m.group(2), m.group(3)
-        qty = int(qty_str.replace(",", ""))
-        if qty >= 0:
-            continue
-        proceeds_usd = float(proceeds_str.replace(",", ""))
-        date_str = symbol_date.get(symbol)
-        if not date_str:
-            raise RuntimeError(f"No sell date found for symbol {symbol}")
-        rate = boi_ils("USD", date_str)
-        total_ils += proceeds_usd * rate
-        print(f"  {date_str} {symbol} sell qty={qty} proceeds=${proceeds_usd:.2f} @ {rate:.4f} = {proceeds_usd*rate:.2f} ILS")
-
-    if total_ils == 0:
-        raise RuntimeError("No stock sell trades found in PDF")
-    return round(total_ils)
 
 
 def extract_year_from_filename(path: str) -> str:
