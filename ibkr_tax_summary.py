@@ -204,7 +204,10 @@ def parse_withholding_tax_ils(text: str) -> int:
     m = re.search(r"Withholding Tax\s+([-\d,]+\.\d+)", text)
     if not m:
         raise RuntimeError("Could not parse Withholding Tax from Cash Report")
-    return round(float(m.group(1).replace(",", "")))
+    value = float(m.group(1).replace(",", ""))
+    if value > 0:
+        raise RuntimeError(f"Expected withholding tax to be negative, got {value}")
+    return round(abs(value))
 
 
 def parse_realized_stocks_ils(text: str) -> tuple[int, int]:
