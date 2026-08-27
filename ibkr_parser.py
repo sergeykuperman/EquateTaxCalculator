@@ -442,6 +442,60 @@ def _parse_trade_lots(text: str) -> list[dict]:
     return result_rows
 
 
+def _has_unparsed_disposals(text: str) -> bool:
+    """
+    Return True if the text contains signals that stock disposals occurred but
+    were not captured by the parsers.  Used to distinguish "no sales this year"
+    from a genuine parse failure.
+
+    Signals checked:
+    1. C-coded fills (CHILD_FILL_PATTERN / AGGREGATE_FILL_PATTERN) in the text —
+       closing trades that should have produced lots.
+    2. Negative-quantity stock trade lines (excluding forex symbols like USD.ILS).
+    3. Non-zero stock realized P/L in the Realized & Unrealized Performance Summary.
+    """
+    # 1. C-coded fill lines
+    if CHILD_FILL_PATTERN.search(text) or AGGREGATE_FILL_PATTERN.search(text):
+        return True
+
+    # 2. Negative-quantity stock lines (not forex).
+    # Stock trade lines look like: SYMBOL EXCHANGE -qty price ...
+    # Forex lines contain a dot (e.g. USD.ILS) — exclude those.
+    neg_stock_trade = re.compile(
+        r"^([A-Z][A-Z0-9]{0,9})\s+\S+\s+(-[\d,]+(?:\.\d+)?)\s+[\d.]+",
+        re.MULTILINE,
+    )
+    for m in neg_stock_trade.finditer(text):
+        symbol = m.group(1)
+        if "." not in symbol:   # forex symbols contain a dot
+            return True
+
+    # 3. Non-zero stock realized P/L in the Performance Summary.
+    # Lines look like: SYMBOL  cost  s/t_profit  s/t_loss  l/t_profit  l/t_loss  total ...
+    # A non-zero realized gain or loss means a position was closed.
+    # Exclude currency/forex symbols — they appear in the same section but are not stock lots.
+    _CURRENCY_SYMBOLS = frozenset({"USD", "EUR", "GBP", "CAD", "CHF", "JPY", "AUD",
+                                   "ILS", "HKD", "SGD", "NZD", "SEK", "NOK", "DKK"})
+    perf_line = re.compile(
+        r"^([A-Z][A-Z0-9]{0,9})\s+"     # symbol (no dot → not forex pair)
+        r"[\d,]+\.\d+\s+"               # cost adj
+        r"([-\d,]+\.\d+)\s+"            # S/T profit
+        r"([-\d,]+\.\d+)\s+"            # S/T loss
+        r"([-\d,]+\.\d+)\s+"            # L/T profit
+        r"([-\d,]+\.\d+)",              # L/T loss
+        re.MULTILINE,
+    )
+    for m in perf_line.finditer(text):
+        symbol = m.group(1)
+        if "." in symbol or symbol in _CURRENCY_SYMBOLS:
+            continue
+        values = [float(m.group(i).replace(",", "")) for i in (2, 3, 4, 5)]
+        if any(v != 0.0 for v in values):
+            return True
+
+    return False
+
+
 def parse_ibkr_lots_detail(text: str) -> list[dict]:
     """
     Parse all taxable IBKR stock disposals: normal Trades (C-coded fills) and
@@ -450,13 +504,21 @@ def parse_ibkr_lots_detail(text: str) -> list[dict]:
     Returns one dict per closed acquisition lot with raw broker facts only.
     No ILS conversion, no Moses calculation — those happen in capital_gains.py.
 
-    Raises RuntimeError if neither source produces any lots.
+    Returns [] when the PDF is valid but contains no taxable stock disposals
+    (e.g. a year where only opening trades occurred).
+
+    Raises RuntimeError when disposal signals are present but no lots were parsed
+    (indicating a parse failure rather than a genuinely empty year).
     """
     trade_lots = _parse_trade_lots(text)
     ca_lots    = parse_ibkr_corporate_action_lots(text)
     all_lots   = trade_lots + ca_lots
-    if not all_lots:
-        raise RuntimeError("No taxable IBKR stock disposals found in PDF")
+    if not all_lots and _has_unparsed_disposals(text):
+        raise RuntimeError(
+            "IBKR PDF contains signals of stock disposals (C-coded fills, "
+            "negative-quantity trades, or non-zero realized P/L) but no lots "
+            "were parsed. Check that the correct tax statement PDF was supplied."
+        )
     return all_lots
 
 
@@ -552,23 +614,23 @@ def parse_dividends_by_country(pdf_path: str, ticker_tax_country: dict) -> dict:
 
 
 def parse_interest_transactions_ils(pdf_path: str) -> float:
-    """Parse interest transactions from left column of all Interest pages; convert at per-transaction BoI rate."""
+    """Parse interest transactions from all pages; convert at per-transaction BoI rate."""
     row_pattern = re.compile(r"^(\d{4}-\d{2}-\d{2})\s+(USD|EUR|GBP|CAD|CHF|JPY|AUD)\s+.+\s+([\d,]+\.\d+)$")
     total = 0.0
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            if "Interest" not in (page.extract_text() or ""):
+            full_text = page.extract_text() or ""
+            if "Interest" not in full_text:
                 continue
-            left = page.crop((0, 0, page.width * 0.5, page.height))
             in_interest = False
-            for line in (left.extract_text() or "").splitlines():
+            for line in full_text.splitlines():
                 s = line.strip()
                 if s == "Interest":
                     in_interest = True
                     continue
                 if not in_interest:
                     continue
-                if "Total Interest in ILS" in s:
+                if s.startswith("Total in ILS") or s.startswith("Fees") or s.startswith("Total Interest in ILS"):
                     break
                 m = row_pattern.match(s)
                 if m:

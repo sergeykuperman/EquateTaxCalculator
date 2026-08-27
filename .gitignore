@@ -8,6 +8,9 @@ portfolio_projection_5y.xlsx
 # integration test fixtures (contain personal financial data — never commit)
 tests/integration/fixtures/
 
+# taxpayer identity (personal data — never commit)
+taxpayer.json
+
 # Windows NTFS alternate data streams
 *:Zone.Identifier
 

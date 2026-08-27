@@ -51,6 +51,36 @@ Produces **`form1325_support_2024.xlsx`** with six sheets:
 
 **Verify before proceeding:** open "Rounding & Cross-Check" — all "Aggregation rule satisfied?" must be True.
 
+### Step 1b — Generate Form 1325 PDF (auto-run by Step 1, or separately)
+
+Step 1 automatically generates the PDF after writing the XLSX. To run it separately or regenerate:
+
+```bash
+python generate_1325_pdf.py --year 2024
+```
+
+Requires `taxpayer.json` in the repo root (git-ignored — never commit):
+```json
+{"taxpayer_name": "Your Name In Hebrew", "file_number": "123456789"}
+```
+
+Or pass identity on the CLI:
+```bash
+python generate_1325_pdf.py --year 2024 --taxpayer-name "קופרמן סרגיי" --file-number "313985129"
+```
+
+Produces **`form1325_<year>_25pct.pdf`** — the official Form 1325 filled with all Entry View values, ready for submission.
+
+Blank official templates live in `templates/1325/` for years 2020–2025.
+
+Other options:
+```
+--no-signature          skip inserting signature.jpg
+--signature-date DATE   override signature date (default: today, DD/MM/YYYY)
+--output-dir PATH       output directory (default: .)
+--debug                 emit debug PDF with labelled red field-anchor boxes
+```
+
 ### Step 2 — Generate annual filing summary
 
 ```bash
@@ -123,6 +153,9 @@ pytest test_tax.py -v -m "not integration"
 
 # Integration tests (require 2024 source files in tests/integration/fixtures/2024/):
 pytest tests/integration/test_2024_pipeline.py -v
+
+# PDF generation regression test (requires form1325_support_2022.xlsx + 2022 template):
+pytest tests/integration/test_2022_pdf.py -v
 ```
 
 Integration fixture layout (excluded from git — contains personal financial data):
@@ -145,6 +178,7 @@ See `tests/integration/fixtures/2024/README.md` for setup instructions.
 | `equate_parser.py` | EquatePlus CSV+PDF parsing; returns raw broker facts |
 | `capital_gains.py` | FX conversion, commission allocation, adjusted cost, Moses application |
 | `generate_1325_support.py` | Authoritative filing pipeline → `form1325_support_<year>.xlsx` |
+| `generate_1325_pdf.py` | Presentation layer: fills official Form 1325 PDF from Entry View → `form1325_<year>_25pct.pdf` |
 | `annual_tax_summary.py` | Reads Tax Data; adds income; → `tax_annual_summary_<year>.xlsx` |
 | `tax_calculator.py` | Diagnostic per-sale worksheets (audit only) |
 | `compound_calc.py` | Standalone portfolio projection (unrelated to tax calculator) |
