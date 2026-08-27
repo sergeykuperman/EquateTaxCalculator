@@ -509,10 +509,14 @@ def main():
         print(f"\nParsing IBKR closed lots from {ibkr_pdf} ...")
         text = extract_full_text(ibkr_pdf)
         raw_ibkr = parse_ibkr_lots_detail(text)
-        print(f"  Applying FX conversion and Moses to {len(raw_ibkr)} IBKR raw lots ...")
-        ibkr_lots = build_ibkr_lots(raw_ibkr)
-        print(f"  {len(ibkr_lots)} IBKR lot rows calculated")
-        all_rows.extend(ibkr_lots)
+        if raw_ibkr:
+            print(f"  Applying FX conversion and Moses to {len(raw_ibkr)} IBKR raw lots ...")
+            ibkr_lots = build_ibkr_lots(raw_ibkr)
+            print(f"  {len(ibkr_lots)} IBKR lot rows calculated")
+            all_rows.extend(ibkr_lots)
+        else:
+            print(f"  No taxable IBKR stock disposals found — no IBKR capital gains rows added.")
+            print(f"  (IBKR PDF will still be used for dividends/interest in annual_tax_summary.py)")
 
     if eq_csvs:
         print(f"\nParsing EquatePlus lots from {len(eq_csvs)} CSV/PDF pair(s) ...")
@@ -598,6 +602,15 @@ def main():
     print(f"Done. Wrote {out_path} ({len(sorted_rows)} lot rows, {n_forms} form page(s))")
     print("Verify: open 'Rounding & Cross-Check' sheet — all 'Aggregation rule satisfied?' should be True.")
     print("        open 'Tax Data' sheet — one row per lot, lot_id unique.")
+
+    try:
+        from generate_1325_pdf import generate_pdfs
+        pdf_paths = generate_pdfs(year=year, xlsx_path=out_path)
+        for p in pdf_paths:
+            print(f"  PDF: {p}")
+    except Exception as _pdf_exc:
+        print(f"WARNING: PDF generation failed: {_pdf_exc}")
+        print(f"  XLSX is valid. Run: python generate_1325_pdf.py --year {year}")
 
 
 if __name__ == "__main__":

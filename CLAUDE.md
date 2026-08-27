@@ -15,6 +15,10 @@ pip install -r requirements.txt
 ```bash
 # Step 1 — authoritative Form 1325 support workbook (run first)
 python generate_1325_support.py --year 2024 [--ibkr-pdf PATH]
+# → also auto-generates form1325_2024_25pct.pdf (non-fatal if PDF generation fails)
+
+# Step 1b (optional) — generate / regenerate Form 1325 PDF separately
+python generate_1325_pdf.py --year 2024 [--config taxpayer.json]
 
 # Step 2 — annual filing summary (reads Tax Data from step 1)
 python annual_tax_summary.py --year 2024 [--ibkr-pdf PATH]
@@ -25,6 +29,7 @@ python tax_calculator.py
 # Tests
 pytest test_tax.py -v -m "not integration"                    # unit tests, no source files needed
 pytest tests/integration/test_2024_pipeline.py -v             # integration tests (need fixtures)
+pytest tests/integration/test_2022_pdf.py -v                  # PDF generation regression test
 ```
 
 ## Architecture
@@ -52,6 +57,12 @@ ibkr_parser.py                    equate_parser.py
                 ├─ Rounding & Cross-Check
                 ├─ Metadata
                 └─ Sources           (one row per source file + SHA-256)
+                          ↓
+              generate_1325_pdf.py
+              (presentation layer only — reads Form 1325 Entry View)
+              (templates from templates/1325/, taxpayer identity from taxpayer.json)
+                          ↓
+              form1325_<year>_25pct.pdf
                           ↓
               annual_tax_summary.py
               (reads Tax Data — no Moses, no source re-parsing)
@@ -100,6 +111,16 @@ ibkr_parser.py                    equate_parser.py
 - `_verify_ibkr_pdf_hash()` — checks IBKR PDF sha256 against Sources sheet before parsing income
 - Aggregates by `(source, tax_rate)`; raises RuntimeError on any rate outside `{0.25}`
 - Never re-parses source files for capital gains
+
+**`generate_1325_pdf.py`** — Form 1325 PDF generator (presentation layer only)
+- CLI: `--year YYYY`, `--xlsx PATH`, `--template PATH`, `--signature PATH`, `--output-dir PATH`, `--no-signature`, `--signature-date DD/MM/YYYY`, `--taxpayer-name TEXT`, `--file-number TEXT`, `--config PATH`, `--debug`
+- Reads `Form 1325 Entry View` exclusively — no tax calculations, no re-parsing of source files
+- Templates in `templates/1325/`; calibrated for years 2020–2025; raises for uncalibrated years
+- Taxpayer identity: CLI args → `taxpayer.json` (git-ignored) → raise; never inferred from XLSX
+- `taxpayer.json` format: `{"taxpayer_name": "קופרמן סרגיי", "file_number": "313985129"}` — normal Unicode Hebrew (BiDi reordering applied internally via `python-bidi`)
+- Groups data rows by `(form_no, rate_int_pct)`; one PDF per group; max 10 rows per form
+- Called non-fatally by `generate_1325_support.py` after XLSX write
+- `generate_pdfs(year, xlsx_path, ...) → list[str]` — public API
 
 **`tax_calculator.py`** — diagnostic per-sale worksheets
 - Uses `parse_equateplus_pair()` + `build_equate_lots()` — no duplicate raw-lot construction

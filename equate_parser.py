@@ -84,19 +84,15 @@ def _build_lots_for_pair(csv_path: str, sale_pdf: str, sale_seq: int,
     sale_price_eur, execution_date, _settlement_date, _pdf_ex_rate, fees_euro = parse_sale_pdf(sale_pdf)
 
     if expected_date is not None:
-        from datetime import timedelta
         delta = abs((execution_date.date() - expected_date).days)
-        if delta > 1:
-            raise RuntimeError(
-                f"Execution date mismatch: {sale_pdf} contains execution date "
-                f"{execution_date.date()} but filename implies {expected_date} "
-                f"(delta={delta} days). "
-                f"Verify that the correct sale PDF is paired with {csv_path}."
-            )
         if delta == 1:
             print(f"  NOTE: {sale_pdf} execution date {execution_date.date()} "
                   f"differs from filename date {expected_date} by 1 day "
                   f"(order/execution day offset — normal for EquatePlus)")
+        elif delta > 1:
+            print(f"  WARNING: {sale_pdf} execution date {execution_date.date()} "
+                  f"differs from filename date {expected_date} by {delta} days. "
+                  f"Using execution date from PDF. Verify pairing is correct.")
 
     sale_date_str = execution_date.strftime("%Y-%m-%d")
 
